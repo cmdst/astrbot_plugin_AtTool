@@ -1,17 +1,59 @@
 {
   "permission_verification": {
     "type": "bool",
-    "description": "开启权限验证",
-    "hint": "开启过后仅管理员、群主或者Bot管理员可以触发艾特全体",
+    "description": "开启 @全体 权限验证",
+    "hint": "开启后仅群主、管理员或 Bot 超级管理员可以触发 @全体",
     "default": true
+  },
+  "allow_direct_qq_at": {
+    "type": "bool",
+    "description": "允许直接使用 QQ 号艾特",
+    "hint": "开启后用户可以直接提供 QQ 号让机器人艾特；关闭后机器人必须通过搜索群成员来获取 ID",
+    "default": true
+  },
+  "enable_fuzzy_search": {
+    "type": "bool",
+    "description": "启用模糊昵称搜索",
+    "hint": "开启后支持昵称部分匹配（如搜「张」可找到「张三」）；关闭后必须完全匹配才能艾特",
+    "default": true
+  },
+  "session_whitelist": {
+    "type": "list",
+    "description": "会话白名单",
+    "hint": "仅允许在这些会话中使用艾特功能。每个条目可以是完整 UMO（用 /sid 获取）或群号。留空表示允许全部会话",
+    "default": []
+  },
+  "session_blacklist": {
+    "type": "list",
+    "description": "会话黑名单",
+    "hint": "禁止在这些会话中使用艾特功能。格式同白名单。黑名单优先级高于白名单",
+    "default": []
   },
   "llm_prompt": {
     "type": "text",
-    "description": "LLM 的 @ 输出提示词",
-    "hint": "这段系统提示词会在每次请求前注入，可直接在编辑器中修改；@全体权限结论会由插件动态补充",
-    "default": "\n【输出层@规范指令】\n1. 当你需要艾特（提及）某个群成员时，请在回复中插入格式为`[at:用户ID]`的标签。\n2. 用户ID必须是纯数字。在调用此功能前，请务必先使用`get_group_members`工具查询成员列表以获取正确的 Userid。\n3. 标签前后请勿添加空格，确保文本连贯性。\n4. 严禁捏造 Userid，必须以查询到的实际数据为准。\n5. 当你需要艾特全体成员时，`[at:all]`属于高风险标签，只有在确有必要通知全群时才可以使用；是否具备权限以系统额外告知为准。\n示例：你好[at:123456789]，关于你的问题...\n艾特全体示例：[at:all]请大家注意以下通知...",
+    "description": "LLM 自定义提示词基底",
+    "hint": "这是注入给 LLM 的艾特格式说明。由平台限制，@ 会被自动渲染到消息最前面",
+    "default": "\n## 艾特操作\n\n当用户要求你艾特某个群成员时，应当调用 `search_and_mention` 工具。\n该工具会返回 [at:ID] 标签，你只需要把标签放到你回复的正文里即可。\n\n### 红线\n- 禁止把工具返回的原始文本直接发给用户\n- 禁止描述工具调用过程（如「让我查查」「找到了」「正在艾特」）\n- 禁止捏造用户 ID",
     "editor_mode": true,
     "editor_language": "markdown",
     "editor_theme": "vs-light"
+  },
+  "at_all_cooldown": {
+    "type": "int",
+    "description": "@全体 冷却限制秒数",
+    "hint": "同一群两次 @全体 的最小间隔秒数，0 表示不限制。处于冷却内的第二次 @全体 会被自动拦截并降级为纯文本「@全体成员」，并向操作者反馈受限原因。",
+    "default": 60
+  },
+  "enable_audit_log": {
+    "type": "bool",
+    "description": "开启艾特操作审计日志",
+    "hint": "开启后每次生效的艾特（@单人 / @全体放行 / @全体被拦截）都会落盘一条审计记录到插件数据目录的 audit/ 子目录，按日切割为 JSONL。",
+    "default": true
+  },
+  "member_list_cache_ttl": {
+    "type": "int",
+    "description": "群成员列表缓存秒数",
+    "hint": "千人级大群搜索时复用群成员列表以减少重复全量拉取。本值为缓存有效期秒数，0 表示不缓存（每次搜索都重新拉取）。",
+    "default": 180
   }
 }
