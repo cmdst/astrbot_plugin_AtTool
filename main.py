@@ -20,6 +20,7 @@ from .utils import (
     check_session_lists,
     drop_expired,
     evict_oldest_to_limit,
+    expand_alias_queries,
     format_member_choice_list,
     format_single_member_result,
     is_at_all_in_cooldown,
@@ -145,6 +146,23 @@ class LLMAtToolPlugin(Star):
         self.member_list_cache_ttl = _to_int(
             self.config.get("member_list_cache_ttl", 180), 180
         )
+
+        # ---- 别名映射（用户确认方案）：搜索未命中时按别名展开再搜 ----
+        # 兼容 {"才俊": "柴郡"} 字典与 ["才俊=柴郡"] 列表两种配置形态。
+        raw_aliases = self.config.get("member_aliases", []) or []
+        self.member_aliases: dict[str, str] = {}
+        if isinstance(raw_aliases, dict):
+            for alias, target in raw_aliases.items():
+                alias_s = str(alias).strip()
+                target_s = str(target).strip()
+                if alias_s and target_s:
+                    self.member_aliases[alias_s] = target_s
+        elif isinstance(raw_aliases, list):
+            for item in raw_aliases:
+                if isinstance(item, str) and "=" in item:
+                    alias_s, _, target_s = item.partition("=")
+                    if alias_s.strip() and target_s.strip():
+                        self.member_aliases[alias_s.strip()] = target_s.strip()
 
         # ---- 缓存结构：统一 (payload, created_ts) 维度 ----
         # 权限缓存：value = (allowed, deny_reason, created_ts)
@@ -442,6 +460,20 @@ class LLMAtToolPlugin(Star):
         full_instruction = static_part + "\n\n" + dynamic_part
         req.system_prompt = (req.system_prompt or "") + full_instruction
 
+        # 可观测性：群聊中出现艾特意图关键词时记录注入（用于区分
+        # “提示词未注入”与“模型未按提示词调用工具”两类失败）
+        try:
+            msg_text = getattr(event, "message_str", "") or ""
+            if event.get_group_id() and re.search(
+                r"艾特|叫一下|喊一下|呼叫|@|\bat\b", msg_text, re.IGNORECASE
+            ):
+                logger.info(
+                    f"[AtTool] 检测到艾特意图，已注入艾特指令（会话 "
+                    f"{event.unified_msg_origin}）"
+                )
+        except Exception:
+            pass
+
         if self.permission_verification:
             allowed, deny_message = await self._get_at_all_permission_result(event)
             if allowed:
@@ -500,30 +532,50 @@ class LLMAtToolPlugin(Star):
                 self._fallback_at.pop(umo, None)
                 return "【错误】无法获取群成员列表。"
 
-            exact_matches = []
-            fuzzy_matches = []
+            def _collect(term: str) -> Tuple[list, list]:
+                """按 term 收集精确/模糊命中（闭包复用原始匹配逻辑）。"""
+                exact: list = []
+                fuzzy: list = []
+                term = (term or "").strip()
+                if not term:
+                    return exact, fuzzy
+                for m in raw_members:
+                    user_id = str(m.get("user_id", ""))
+                    if not user_id:
+                        continue
+                    nickname = m.get("nickname", "")
+                    card = m.get("card", "")
+                    role = m.get("role", "member")
+                    display_name = card or nickname
+                    if term == nickname or term == card or term == display_name:
+                        exact.append((user_id, display_name, role))
+                    elif self.enable_fuzzy_search and (
+                        term in nickname or term in card
+                    ):
+                        fuzzy.append((user_id, display_name, role))
+                return exact, fuzzy
 
-            for m in raw_members:
-                user_id = str(m.get("user_id", ""))
-                if not user_id:
-                    continue
-                nickname = m.get("nickname", "")
-                card = m.get("card", "")
-                role = m.get("role", "member")
-                display_name = card or nickname
-
-                if name_str == nickname or name_str == card or name_str == display_name:
-                    exact_matches.append((user_id, display_name, role))
-                elif self.enable_fuzzy_search and (
-                    name_str in nickname or name_str in card
-                ):
-                    fuzzy_matches.append((user_id, display_name, role))
+            exact_matches, fuzzy_matches = _collect(name_str)
+            if not exact_matches and not fuzzy_matches:
+                # 别名兜底（如「才俊」→「柴郡」）：原始词未命中时，
+                # 按 member_aliases 配置展开真名/群名片再搜一次
+                for alt in expand_alias_queries(name_str, self.member_aliases):
+                    if alt == name_str:
+                        continue
+                    alt_exact, alt_fuzzy = _collect(alt)
+                    if alt_exact or alt_fuzzy:
+                        exact_matches, fuzzy_matches = alt_exact, alt_fuzzy
+                        break
 
             matches = exact_matches if exact_matches else fuzzy_matches
 
             if not matches:
                 mode = "包含" if self.enable_fuzzy_search else "完全匹配"
                 self._fallback_at.pop(umo, None)
+                logger.info(
+                    f"[AtTool] search_and_mention 未命中: 关键词=「{name_str}」"
+                    f"（{mode}匹配，会话 {umo}）"
+                )
                 return f"【未找到】群聊中没有找到名称{mode}「{name_str}」的成员。"
 
             if len(matches) > _MAX_MULTI_MATCHES:
@@ -539,6 +591,10 @@ class LLMAtToolPlugin(Star):
                 # process_at_tags 自动补插 [at:ID]
                 self._fallback_at[umo] = (user_id, time.time())
                 drop_expired(self._fallback_at, _FALLBACK_AT_TTL, time.time())
+                logger.info(
+                    f"[AtTool] search_and_mention 命中: {display_name} ({user_id}，"
+                    f"{role}，会话 {umo})"
+                )
                 return format_single_member_result(display_name, user_id, role)
 
             # 多结果：需用户选择序号后经 select_member_by_index 选定，
@@ -710,8 +766,11 @@ class LLMAtToolPlugin(Star):
 
         # ① 合并相邻 Plain：修复标签被第三方插件拆分到相邻组件的情况
         #    （如 "[at:12" 与 "345]" 分处两个 Plain，合并后可完整匹配）。
-        #    注：此处原地修改首个 Plain 的 text；渲染后整链被替换，原对象
-        #    不再被 result.chain 引用，无副作用。
+        #    注：合并必须生成新 Plain 对象（非原地修改首个 Plain 的 text）：
+        #    merged_input 与调用方 chain 共享组件引用，若原地修改，提前
+        #    return False 的路径（无标签且无兜底，rendered=False 调用方保留
+        #    原链）会把"首 Plain 已含合并文本 + 尾 Plain 仍在"的重复内容
+        #    泄漏回原链，导致消息文本重复渲染。
         merged_input: List[BaseMessageComponent] = []
         for comp in chain:
             if (
@@ -719,7 +778,7 @@ class LLMAtToolPlugin(Star):
                 and merged_input
                 and isinstance(merged_input[-1], Plain)
             ):
-                merged_input[-1].text += comp.text
+                merged_input[-1] = Plain(merged_input[-1].text + comp.text)
             else:
                 merged_input.append(comp)
 
@@ -1022,20 +1081,26 @@ class LLMAtToolPlugin(Star):
     # P4 send 兜底渲染：免疫"清空 chain 后直接 event.send()"的第三方插件
     # ------------------------------------------------------------------ #
     def _wrap_event_send(self, event: AstrMessageEvent) -> None:
-        """给当前事件实例的 send 绑定"发送前最后渲染"兜底（实例级、幂等）。
+        """给当前事件实例的 send / send_streaming 绑定"发送前最后渲染"兜底。
 
         第三方插件（如分段插件）可能在 on_decorating_result 钩子内
-        result.chain.clear() 后直接 event.send() 纯文本段——此时 [at:ID]
-        仍是文本，延迟渲染钩子（priority=-1000）执行时链已空、标签已发出。
-        本包装器在消息真正发往平台前完成渲染，使艾特免疫"清链直发"类插件。
+        result.chain.clear() 后直接 event.send() 纯文本段；流式输出则由
+        respond.stage 直接调 event.send_streaming() 交付平台适配器。两条
+        路径下 [at:ID] 都可能仍是纯文本，延迟渲染钩子（priority=-1000）
+        已无法兜底，本包装器在消息真正发往平台前完成渲染。
 
         实例级绑定：仅影响当前事件对象，随事件生命周期结束自动失效，无
         全局副作用、热重载无需恢复。幂等：重复调用只包装一次。
 
         ⚠️需确认：AstrBot 无官方"发送前"事件钩子（on_decorating_result
         为唯一发送前扩展点，OnAfterMessageSentEvent 在发送后），故采用
-        实例方法包装实现最终阶段渲染；包装仅检查含 "[at:" 的链，其余消息
-        零开销原样透传。
+        实例方法包装实现最终阶段渲染；包装仅处理含 "[at:" 的消息或存在
+        兜底缓存的事件，其余消息零开销原样透传。
+
+        2026-09-07 增强（分段清链丢艾特修复）：分段插件清空 result.chain
+        直发各段时主钩子链空无法兜底，若模型漏写 [at:ID] 标签则艾特全丢。
+        现 send / send_streaming 路径也会执行兜底补插（事件级一次性），
+        并用 event._attool_send_at_done 标记防止跨段重复艾特。
         """
         if getattr(event, "_attool_send_wrapped", False):
             return
@@ -1043,19 +1108,110 @@ class LLMAtToolPlugin(Star):
         if original_send is None:
             return
 
+        async def _render_message(message: Any) -> Tuple[Any, bool]:
+            """渲染含 [at:] 的消息；返回 (最终消息, 是否发生了替换)。
+
+            发送路径兜底补插：分段插件清空 result.chain 后直发各段时，
+            主钩子（priority=-1000）执行时链已空、无法履行兜底补插义务；
+            若模型最终回复又漏写 [at:ID] 标签，艾特将完全丢失（09-07
+            实测复现：工具命中但无审计记录）。本方法在消息真正发往平台前
+            补插一次，并用事件级标记防重复：
+            - 本事件尚未送出艾特、兜底缓存存在且本段无标签 → 补插一次；
+            - 本事件已送出艾特（补插或先前段渲染）→ 后续段的 [at:] 标签
+              剥离为纯文本，杜绝跨段重复艾特。
+            """
+            chain = getattr(message, "chain", None)
+            is_str = isinstance(message, str)
+            if is_str and "[at:" in message:
+                chain = [Plain(message)]
+            if not isinstance(chain, list):
+                return message, False
+            # 字面 \n 兜底（2026-08-11）：LLM 偶发把换行转义序列（\n）
+            # 当字面文本输出，分段插件只认真实换行切不动、发送管道不
+            # 转义，导致明文 \n 暴露在群里。发送前统一转真实换行
+            # （角色卡换行规范已治本，此为防御兜底）。
+            # 快速路径：仅含反斜杠的 Plain 才处理，其余零开销。
+            for comp in chain:
+                if isinstance(comp, Plain) and "\\n" in comp.text:
+                    comp.text = (
+                        comp.text.replace("\\r\\n", "\n")
+                        .replace("\\r", "\n")
+                        .replace("\\n", "\n")
+                    )
+            has_tag = any(
+                isinstance(comp, Plain) and "[at:" in comp.text for comp in chain
+            )
+            if not has_tag:
+                # 发送路径兜底补插（事件级一次性）：分段直发 + 模型漏写
+                # 标签时保证艾特不丢；复用 _apply_fallback_at_tag 的缓存/
+                # 会话准入/去重语义
+                if (
+                    not getattr(event, "_attool_send_at_done", False)
+                    and self._apply_fallback_at_tag(event, chain)
+                ):
+                    setattr(event, "_attool_send_at_done", True)
+            elif getattr(event, "_attool_send_at_done", False):
+                # 本事件已送出过成员艾特，后续段的 [at:ID] 剥离为纯文本，
+                # 避免跨段重复艾特；[at:all] 不属于兜底范围，仍交给
+                # _render_at_tags 走权限/冷却判定
+                for comp in chain:
+                    if isinstance(comp, Plain):
+                        comp.text = _LOOSE_AT_PATTERN.sub("", comp.text)
+            rendered, new_chain = await self._render_at_tags(event, chain)
+            if not rendered:
+                return message, False
+            setattr(event, "_attool_send_at_done", True)
+            if is_str:
+                try:
+                    from astrbot.core.message.message_event_result import (
+                        MessageChain,
+                    )
+                except Exception:
+                    return message, False
+                return MessageChain(chain=new_chain), True
+            message.chain = new_chain
+            return message, True
+
         async def send_with_at_render(message: Any) -> None:
             try:
-                chain = getattr(message, "chain", None)
-                if isinstance(chain, list):
-                    rendered, new_chain = await self._render_at_tags(event, chain)
-                    if rendered:
-                        message.chain = new_chain
+                rendered_message, _ = await _render_message(message)
             except Exception as exc:
                 # 兜底渲染失败绝不影响消息发出
                 logger.error(f"AtTool 发送前渲染兜底异常，已按原样发送: {exc}")
-            return await original_send(message)
+                rendered_message = message
+            return await original_send(rendered_message)
 
         event.send = send_with_at_render  # 实例属性遮蔽类方法
+
+        original_send_streaming = getattr(event, "send_streaming", None)
+        if original_send_streaming is not None:
+
+            async def send_streaming_with_at_render(
+                generator: Any, use_fallback: bool = False
+            ) -> None:
+                """流式发送兜底渲染：逐段渲染 [at:ID] 后转交原 send_streaming。
+
+                流式响应由 respond.stage 直接调 event.send_streaming() 交付
+                平台适配器，绕过 event.send 包装器；若 [at:ID] 恰好整体落在
+                某一段内，在此处补渲染，保证引用回复/分段场景下艾特不丢失。
+                """
+
+                async def render_gen() -> Any:
+                    async for item in generator:
+                        try:
+                            rendered_message, _ = await _render_message(item)
+                        except Exception as exc:
+                            # 兜底渲染失败绝不影响消息发出
+                            logger.error(
+                                f"AtTool 流式发送兜底渲染异常，已按原样发送: {exc}"
+                            )
+                            rendered_message = item
+                        yield rendered_message
+
+                await original_send_streaming(render_gen(), use_fallback)
+
+            event.send_streaming = send_streaming_with_at_render
+
         event._attool_send_wrapped = True
 
     # ------------------------------------------------------------------ #

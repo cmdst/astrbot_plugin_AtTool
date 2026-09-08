@@ -24,6 +24,7 @@ from utils import (
     check_session_lists,
     drop_expired,
     evict_oldest_to_limit,
+    expand_alias_queries,
     format_member_choice_list,
     format_role_label,
     format_single_member_result,
@@ -250,6 +251,40 @@ class TestFormatMemberChoiceList:
     def test_empty_matches(self):
         text = format_member_choice_list("x", [])
         assert "共 0 个" in text
+
+
+# --------------------------------------------------------------------------- #
+# 别名展开（用户确认方案：才俊 -> 柴郡）
+# --------------------------------------------------------------------------- #
+class TestExpandAliasQueries:
+    """expand_alias_queries：别名展开去重保序。"""
+
+    def test_no_alias_returns_original(self):
+        assert expand_alias_queries("才俊", None) == ["才俊"]
+        assert expand_alias_queries("才俊", {}) == ["才俊"]
+
+    def test_dict_alias_matched(self):
+        out = expand_alias_queries("才俊", {"才俊": "柴郡", "柴俊": "柴郡"})
+        assert out == ["才俊", "柴郡"]
+
+    def test_dict_alias_list_target(self):
+        out = expand_alias_queries("才俊", {"才俊": ["柴郡", "柴郡〔Bot〕"]})
+        assert out == ["才俊", "柴郡", "柴郡〔Bot〕"]
+
+    def test_other_alias_not_expanded(self):
+        assert expand_alias_queries("才俊", {"阿俊": "阿郡"}) == ["才俊"]
+
+    def test_eq_string_list_form(self):
+        out = expand_alias_queries("才俊", ["才俊=柴郡", "阿俊=阿郡"])
+        assert out == ["才俊", "柴郡"]
+
+    def test_dedupe_preserves_order(self):
+        out = expand_alias_queries("才俊", {"才俊": ["柴郡", "柴郡"]})
+        assert out == ["才俊", "柴郡"]
+
+    def test_empty_query(self):
+        assert expand_alias_queries("", {"": "x"}) == []
+        assert expand_alias_queries(None, {}) == []
 
 
 # --------------------------------------------------------------------------- #

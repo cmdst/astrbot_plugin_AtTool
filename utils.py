@@ -37,6 +37,7 @@ __all__ = [
     "audit_log_path",
     "drop_expired",
     "evict_oldest_to_limit",
+    "expand_alias_queries",
 ]
 
 # 角色原始值 -> 中文展示标签。未知角色保留原值（兜底显示，不做猜测）。
@@ -241,6 +242,52 @@ def format_member_choice_list(
     for index, (uid, dname, role) in enumerate(matches, start=1):
         lines.append(f"{index}. {dname} (ID: {uid}) - {format_role_label(role)}")
     return "\n".join(lines)
+
+
+def expand_alias_queries(query: object, aliases: object) -> List[str]:
+    """按别名映射展开用户搜索词，返回去重保序的候选词列表。
+
+    供 search_and_mention 在原始查询无命中时，用配置的别名（如「才俊」
+    →「柴郡」）展开真实群名片再次搜索。别名配置兼容两种形态：
+    字典 {"才俊": "柴郡"} / {"才俊": ["柴郡", "柴郡〔Bot〕"]}，
+    以及 AstrBot 配置列表常用的 "别名=真名" 字符串。
+
+    Args:
+        query: 用户原始搜索词。
+        aliases: 别名映射；None/空视为无别名。
+
+    Returns:
+        去重保序的候选词列表；首项恒为原始查询（非空时），
+        其后为命中别名的目标真名/群名片。
+    """
+    original = (str(query) if query is not None else "").strip()
+    candidates: List[str] = [original] if original else []
+    if not aliases:
+        return candidates
+
+    items: List[Tuple[str, object]] = []
+    if isinstance(aliases, dict):
+        for key, value in aliases.items():
+            alias_key = str(key).strip()
+            if alias_key:
+                items.append((alias_key, value))
+    elif isinstance(aliases, (list, tuple)):
+        for raw in aliases:
+            if not isinstance(raw, str) or "=" not in raw:
+                continue
+            alias_key, _, target = raw.partition("=")
+            if alias_key.strip() and target.strip():
+                items.append((alias_key.strip(), target.strip()))
+
+    for alias_key, target in items:
+        if original != alias_key:
+            continue
+        targets = target if isinstance(target, (list, tuple)) else [target]
+        for t in targets:
+            cleaned = str(t).strip()
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+    return candidates
 
 
 def build_audit_record(

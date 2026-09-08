@@ -58,7 +58,7 @@ class MessageChainStub:
 
 
 class SendableEvent(FakeEvent):
-    """带 send 记录能力的 FakeEvent（真实事件对象的 send 由平台子类实现）。"""
+    """带 send / send_streaming 记录能力的 FakeEvent。"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -66,6 +66,9 @@ class SendableEvent(FakeEvent):
 
     async def send(self, chain):
         self.sent.append(chain)
+
+    async def send_streaming(self, generator, use_fallback=False):
+        self.sent.extend([item async for item in generator])
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +123,25 @@ class TestDelayedRenderImmunity:
 
         ats = [c for c in ev.get_result().chain if isinstance(c, At)]
         assert len(ats) == 1 and ats[0].qq == "12345"
+
+    async def test_no_tag_adjacent_plain_merge_must_not_duplicate_text(self, tmp_path):
+        """回归：无标签链的相邻 Plain 合并不得原地突变调用方组件。
+
+        修复前：步骤①以 `merged_input[-1].text += comp.text` 原地合并，
+        merged_input 与 result.chain 共享组件引用；rendered=False 提前返回
+        （链内无 [at: 标签且无兜底缓存）时原链首 Plain 已含合并文本而尾
+        Plain 仍在，消息文本重复渲染（如 "你好" + "世界" → "你好世界世界"）。
+        """
+        plugin = make_plugin(audit_dir=tmp_path)
+        first, second = Plain("你好"), Plain("世界")
+        ev = FakeEvent(chain=[first, second])
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        texts = [c.text for c in chain if isinstance(c, Plain)]
+        assert texts == ["你好", "世界"], (
+            f"无标签链不得被合并突变，实际渲染文本: {texts}"
+        )
 
     async def test_process_at_tags_priority_is_minus_1000(self):
         """防回归：priority 必须为 -1000（延迟到最后渲染）。"""
@@ -254,12 +276,12 @@ class TestSendFallbackInvariants:
         assert any("at_member" in r and "10001" in r for r in records)
 
     async def test_send_fallback_injection_when_tag_missing(self, tmp_path):
-        """P1-1（QA 方案 A）：send 路径不补插、不消费缓存；主钩子兜底补插。
+        """send 路径兜底补插：分段直发 + 模型漏写标签时艾特不丢（09-07 修复）。
 
-        旧语义：send 兜底路径补插 [at:ID] 并一次性消费缓存 —— 分段插件
-        逐段 send 时（段1无标签先补插、段2含标签再渲染）同一成员被重复艾特。
-        新语义：补插与消费必须成对发生在主钩子 process_at_tags（整链最后
-        渲染）；send 路径只做"已有标签时的渲染"，绝不补插、绝不消费。
+        旧语义（P1-1 方案 A）：send 路径绝不补插，补插只发生在主钩子；
+        但分段插件清空 result.chain 直发各段时主钩子链空无法补插，模型又
+        漏写标签 → 艾特全丢。新语义：send 路径在兜底缓存存在、本事件尚未
+        送出艾特且本段无标签时补插一次并消费缓存。
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
@@ -269,18 +291,16 @@ class TestSendFallbackInvariants:
         seg = MessageChainStub([Plain("回复没带标签")])
         await ev.send(seg)
 
-        # send 路径：不补插、不消费缓存
-        assert not any(isinstance(c, At) for c in seg.chain), "send 路径绝不补插"
-        assert ev.unified_msg_origin in plugin._fallback_at, "send 路径绝不消费缓存"
-
-        # 主钩子：整链最后渲染时兜底补插并一次性消费
-        ev.set_chain([Plain("回复没带标签")])
-        await plugin.process_at_tags(ev)
-
-        chain = ev.get_result().chain
-        ats = [c for c in chain if isinstance(c, At)]
-        assert len(ats) == 1 and ats[0].qq == "10001", "主钩子兜底补插必须生效"
+        # send 路径：补插一次并消费缓存
+        ats = [c for c in seg.chain if isinstance(c, At)]
+        assert len(ats) == 1 and ats[0].qq == "10001", "send 路径必须兜底补插"
         assert ev.unified_msg_origin not in plugin._fallback_at, "缓存一次性消费"
+        # 补插的标签走正常渲染链路 → 审计落盘
+        date_str = datetime.now().strftime("%Y%m%d")
+        records = (
+            audit_file(tmp_path, date_str).read_text(encoding="utf-8").splitlines()
+        )
+        assert any("at_member" in r and "10001" in r for r in records)
 
     async def test_send_render_respects_blacklist(self, tmp_path):
         """会话准入降级在 send 兜底路径同样生效（[at:ID] 被剥离）。"""
@@ -318,15 +338,102 @@ class TestSendFallbackInvariants:
 
 
 # --------------------------------------------------------------------------- #
-# P1-1 回归：兜底补插/缓存消费仅由主钩子成对执行（send 路径绝不补插/消费）
+# send_streaming 兜底渲染（respond.stage 流式路径绕过 event.send）
+# --------------------------------------------------------------------------- #
+class TestSendStreamingWrapper:
+    """send_streaming 逐段渲染 [at:ID]（引用回复/分段场景的流式兜底）。"""
+
+    async def test_streaming_chunk_with_tag_rendered(self, tmp_path):
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = SendableEvent(chain=[])
+        plugin._wrap_event_send(ev)
+
+        async def gen():
+            yield MessageChainStub([Plain("文本[at:10001]尾巴")])
+
+        await ev.send_streaming(gen())
+
+        sent = ev.sent
+        assert len(sent) == 1
+        ats = [c for c in sent[0].chain if isinstance(c, At)]
+        assert len(ats) == 1 and ats[0].qq == "10001"
+        # 与 send 兜底一致：流式渲染同样落审计
+        date_str = datetime.now().strftime("%Y%m%d")
+        records = (
+            audit_file(tmp_path, date_str).read_text(encoding="utf-8").splitlines()
+        )
+        assert any("at_member" in r and "10001" in r for r in records)
+
+    async def test_streaming_chunk_without_tag_passthrough(self, tmp_path):
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = SendableEvent(chain=[])
+        plugin._wrap_event_send(ev)
+
+        async def gen():
+            yield MessageChainStub([Plain("普通流式文本")])
+
+        await ev.send_streaming(gen())
+
+        sent = ev.sent
+        assert len(sent) == 1
+        assert sent[0].chain[0].text == "普通流式文本"
+
+    async def test_send_str_message_with_tag_rendered(self, tmp_path):
+        """部分发送路径直接传字符串；含 [at:] 时应渲染为 At 后发出。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = SendableEvent(chain=[])
+        plugin._wrap_event_send(ev)
+
+        await ev.send("[at:10001]字符串消息")
+
+        sent = ev.sent
+        assert len(sent) == 1
+        assert hasattr(sent[0], "chain"), "字符串消息渲染后应转为 MessageChain"
+        ats = [c for c in sent[0].chain if isinstance(c, At)]
+        assert len(ats) == 1 and ats[0].qq == "10001"
+
+    async def test_send_str_message_without_tag_passthrough(self, tmp_path):
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = SendableEvent(chain=[])
+        plugin._wrap_event_send(ev)
+
+        await ev.send("普通字符串")
+
+        assert ev.sent == ["普通字符串"]
+
+
+    async def test_streaming_fallback_injection(self, tmp_path):
+        """流式段无标签 + 兜底缓存存在 → send_streaming 路径补插一次。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = SendableEvent(chain=[])
+        plugin._fallback_at[ev.unified_msg_origin] = ("10001", time.time())
+        plugin._wrap_event_send(ev)
+
+        async def gen():
+            yield MessageChainStub([Plain("流式段无标签")])
+
+        await ev.send_streaming(gen())
+
+        sent = ev.sent
+        assert len(sent) == 1
+        ats = [c for c in sent[0].chain if isinstance(c, At)]
+        assert len(ats) == 1 and ats[0].qq == "10001", "流式 send 路径必须兜底补插"
+        assert ev.unified_msg_origin not in plugin._fallback_at, "缓存一次性消费"
+
+
+# --------------------------------------------------------------------------- #
+# 兜底补插语义回归：send 路径补插 + 事件级防重复（分段清链丢艾特修复）
 # --------------------------------------------------------------------------- #
 class TestP1_1FallbackSemantics:
-    async def test_segmented_send_no_duplicate_at(self, tmp_path):
-        """分段插件逐段 send：段1无标签 + 段2含 [at:ID] → 全局仅一次 At。
+    """09-07 修复后语义：send/send_streaming 路径可兜底补插一次并消费缓存，
+    事件级标记 _attool_send_at_done 保证同一事件至多一个艾特。"""
 
-        旧语义下段1无标签先经 send 兜底触发补插（消费缓存）、段2含标签
-        再渲染一次 → 同一成员被艾特两次。方案 A 下 send 路径不补插不消费，
-        最终整个消息流仅产生一次 At（QQ 号正确）。
+    async def test_segmented_send_no_duplicate_at(self, tmp_path):
+        """分段插件逐段 send：段1无标签 → 补插一次；段2含标签 → 被剥离。
+
+        旧语义下段1无标签不补插、段2含标签渲染一次，看似无重复，但模型
+        漏写标签时艾特全丢。新语义：段1补插（消费缓存）后，段2的 [at:ID]
+        剥离为纯文本，全局仍恰好一次 At 且不会丢。
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
@@ -338,20 +445,23 @@ class TestP1_1FallbackSemantics:
         await ev.send(seg1)
         await ev.send(seg2)
 
-        # 段1：无标签 → send 路径不补插，原样透传
-        assert not any(isinstance(c, At) for c in seg1.chain), "段1不得被补插"
-        assert seg1.chain[0].text == "第一段无标签"
-        # 段2：含标签 → 渲染出恰好一个 At，QQ 号正确
-        ats2 = [c for c in seg2.chain if isinstance(c, At)]
-        assert len(ats2) == 1 and ats2[0].qq == "10001", "段2仅渲染一次 At"
+        # 段1：无标签 → send 路径兜底补插一次（消费缓存）
+        ats1 = [c for c in seg1.chain if isinstance(c, At)]
+        assert len(ats1) == 1 and ats1[0].qq == "10001", "段1兜底补插一次"
+        # 段2：事件已送出艾特 → 标签剥离为纯文本，不得重复艾特
+        assert not any(isinstance(c, At) for c in seg2.chain)
+        assert not any(
+            "[at:" in c.text for c in seg2.chain if isinstance(c, Plain)
+        ), "段2标签应被剥离"
         # 全局合计仅一次 At（重复艾特回归点）
-        total = sum(1 for c in seg1.chain if isinstance(c, At)) + len(ats2)
+        total = sum(1 for c in seg1.chain if isinstance(c, At)) + sum(
+            1 for c in seg2.chain if isinstance(c, At)
+        )
         assert total == 1, "同一成员不得被重复艾特"
-        # send 路径不消费缓存：保留给主钩子成对消费
-        assert ev.unified_msg_origin in plugin._fallback_at
+        assert ev.unified_msg_origin not in plugin._fallback_at, "缓存一次性消费"
 
-    async def test_main_hook_fallback_injects_once(self, tmp_path):
-        """段1无标签 + 全链无标签 → 主钩子 process_at_tags 兜底补插恰好一次。"""
+    async def test_main_hook_no_double_inject_after_send_fallback(self, tmp_path):
+        """send 兜底已补插消费后，主钩子不再重复补插。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
         plugin._fallback_at[ev.unified_msg_origin] = ("10001", time.time())
@@ -359,17 +469,14 @@ class TestP1_1FallbackSemantics:
 
         seg1 = MessageChainStub([Plain("第一段无标签")])
         await ev.send(seg1)
-        assert not any(isinstance(c, At) for c in seg1.chain), "send 路径不补插"
-        assert ev.unified_msg_origin in plugin._fallback_at, "send 路径不消费缓存"
+        assert ev.unified_msg_origin not in plugin._fallback_at, "缓存已被 send 路径消费"
 
-        # 主钩子执行（整链最后渲染）：result.chain 为无标签文本 → 补插一次
+        # 主钩子执行：缓存已消费 → 无标签链不再补插
         ev.set_chain([Plain("第一段无标签")])
         await plugin.process_at_tags(ev)
-
         chain = ev.get_result().chain
-        ats = [c for c in chain if isinstance(c, At)]
-        assert len(ats) == 1 and ats[0].qq == "10001", "主钩子兜底补插恰好一次"
-        assert ev.unified_msg_origin not in plugin._fallback_at, "缓存一次性消费"
+        assert not any(isinstance(c, At) for c in chain), "不得重复补插"
+        assert ev.unified_msg_origin not in plugin._fallback_at
 
     async def test_main_hook_consumes_cache_when_has_tag(self, tmp_path):
         """回复已含标签：主钩子消费清理 send 路径保留的缓存（防跨轮次误用）。"""
@@ -385,12 +492,13 @@ class TestP1_1FallbackSemantics:
         )
 
     async def test_main_hook_clears_cache_when_chain_empty(self, tmp_path):
-        """链空（分段插件清链直发后主钩子执行）：必须解除兜底缓存。
+        """链空（分段插件清链直发后主钩子执行）：必须解除残留兜底缓存。
 
-        分段插件清空 result.chain 后直接 event.send()，主钩子执行时链已空，
-        本轮兜底补插义务无法履行；而 send 路径刻意不消费缓存（P1-1 方案 A，
-        保留给主钩子）。若链空时不清理，缓存将残留满 TTL(120s)，新一轮 LLM
-        回复无标签时会误补插上一轮成员（跨轮次误艾特）。
+        分段插件清空 result.chain 后直接 event.send()，补插义务已由 send
+        路径兜底履行并消费缓存（09-07 修复）；主钩子执行时链已空，此处
+        再清理一次防残留（如 send 路径未消费的极端场景）。若链空时不清理，
+        缓存将残留满 TTL(120s)，新一轮 LLM 回复无标签时会误补插上一轮成员
+        （跨轮次误艾特）。
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[])

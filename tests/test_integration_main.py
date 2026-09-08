@@ -54,6 +54,10 @@ def _install_astrbot_stub() -> None:
     )
     core_agent = types.ModuleType("astrbot.core.agent")
     core_agent_message = types.ModuleType("astrbot.core.agent.message")
+    core_message = types.ModuleType("astrbot.core.message")
+    core_message_event_result = types.ModuleType(
+        "astrbot.core.message.message_event_result"
+    )
 
     astrbot.api = api
     api.star = star
@@ -67,6 +71,8 @@ def _install_astrbot_stub() -> None:
     core_aiocqhttp.aiocqhttp_message_event = core_aiocqhttp_event
     core.agent = core_agent
     core_agent.message = core_agent_message
+    core.message = core_message
+    core_message.message_event_result = core_message_event_result
 
     class AstrBotConfig(dict):
         pass
@@ -105,6 +111,10 @@ def _install_astrbot_stub() -> None:
 
     class BaseMessageComponent:
         pass
+
+    class MessageChain:
+        def __init__(self, chain=None):
+            self.chain = chain if chain is not None else []
 
     class TextPart:
         def __init__(self, text=""):
@@ -168,6 +178,7 @@ def _install_astrbot_stub() -> None:
     msg_components.At = At
     msg_components.BaseMessageComponent = BaseMessageComponent
     core_agent_message.TextPart = TextPart
+    core_message_event_result.MessageChain = MessageChain
     core_aiocqhttp_event.AiocqhttpMessageEvent = AiocqhttpMessageEvent
 
     sys.modules["astrbot"] = astrbot
@@ -185,6 +196,10 @@ def _install_astrbot_stub() -> None:
     ] = core_aiocqhttp_event
     sys.modules["astrbot.core.agent"] = core_agent
     sys.modules["astrbot.core.agent.message"] = core_agent_message
+    sys.modules["astrbot.core.message"] = core_message
+    sys.modules[
+        "astrbot.core.message.message_event_result"
+    ] = core_message_event_result
 
 
 _install_astrbot_stub()
@@ -1318,3 +1333,56 @@ class TestFallbackAtTag:
         assert any(
             r["op_type"] == "at_member" and r["target_id"] == "1" for r in recs
         )
+
+
+# --------------------------------------------------------------------------- #
+# 别名兜底搜索（用户确认方案：才俊 -> 柴郡）
+# --------------------------------------------------------------------------- #
+class TestAliasSearch:
+    """search_and_mention 别名展开：原始词未命中时按 member_aliases 再搜。"""
+
+    async def test_alias_hit_single(self, tmp_path):
+        plugin = make_plugin(
+            config={"member_aliases": ["才俊=柴郡"]}, audit_dir=tmp_path
+        )
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.bot.member_list = [
+            {"user_id": "1", "nickname": "柴郡", "card": "柴郡〔Bot〕", "role": "admin"},
+            {"user_id": "2", "nickname": "张三", "card": "", "role": "member"},
+        ]
+        text = await plugin.search_and_mention(ev, "才俊")
+        assert "已找到" in text
+        assert "[at:1]" in text
+
+    async def test_alias_hit_fuzzy_target(self, tmp_path):
+        # 别名目标是子串（搜「柴」也能命中），确认别名兜底与模糊搜索叠加
+        plugin = make_plugin(
+            config={"member_aliases": {"才俊": "柴"}}, audit_dir=tmp_path
+        )
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.bot.member_list = [
+            {"user_id": "1", "nickname": "柴郡", "card": "", "role": "admin"}
+        ]
+        text = await plugin.search_and_mention(ev, "才俊")
+        assert "已找到" in text
+        assert "[at:1]" in text
+
+    async def test_alias_miss_still_not_found(self, tmp_path):
+        plugin = make_plugin(
+            config={"member_aliases": ["才俊=柴郡"]}, audit_dir=tmp_path
+        )
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.bot.member_list = [
+            {"user_id": "2", "nickname": "张三", "card": "", "role": "member"}
+        ]
+        text = await plugin.search_and_mention(ev, "才俊")
+        assert "未找到" in text
+
+    async def test_no_alias_config_unaffected(self, tmp_path):
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.bot.member_list = [
+            {"user_id": "1", "nickname": "柴郡", "card": "", "role": "admin"}
+        ]
+        text = await plugin.search_and_mention(ev, "才俊")
+        assert "未找到" in text
