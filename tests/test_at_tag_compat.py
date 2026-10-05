@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -97,7 +98,7 @@ class TestTagFormMatrixE2E:
     ):
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain(f"前缀{text}后缀")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert _ats(chain) == expected_ats
@@ -142,7 +143,7 @@ class TestTagFormMatrixE2E:
             "[at:" + "1" * 103 + "]",  # 极端超长（F5）
         ):
             ev = FakeEvent(chain=[Plain(raw)])
-            await plugin.process_at_tags(ev)
+            await ti.run_main_hook(plugin, ev)
             chain = ev.get_result().chain
             assert not any(isinstance(c, At) for c in chain), raw
             assert_n1(chain)
@@ -152,7 +153,7 @@ class TestTagFormMatrixE2E:
         plugin = make_plugin(audit_dir=tmp_path)
         for payload in ("1", "10001", "123456789012"):
             ev = FakeEvent(chain=[Plain(f"[at:{payload}]")])
-            await plugin.process_at_tags(ev)
+            await ti.run_main_hook(plugin, ev)
             ats = [c for c in ev.get_result().chain if isinstance(c, At)]
             assert len(ats) == 1
             assert ats[0].toDict() == {"type": "at", "data": {"qq": payload}}
@@ -162,7 +163,7 @@ class TestTagFormMatrixE2E:
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[At:All] 集合")])
         ev.bot.member_info_role = "owner"  # 群主：具备 @全体 权限
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
         assert _ats(ev.get_result().chain) == ["all"]
         assert_n1(ev.get_result().chain)
 
@@ -179,7 +180,7 @@ class TestTagFormMatrixE2E:
         """降级为纯文本的载荷不得写审计（没有真实艾特发生）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("看[at:柴郡]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         log_path = audit_file(tmp_path, datetime.now().strftime("%Y%m%d"))
         assert not log_path.exists(), "降级为纯文本不应产生审计记录"
@@ -195,7 +196,7 @@ class TestTagFormMatrixE2E:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("正文[At：123")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert _ats(chain) == []
@@ -212,7 +213,7 @@ class TestTagFormMatrixE2E:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[at:１２３]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         assert any("无法解析" in str(w) for w in warnings), warnings
 
@@ -221,12 +222,14 @@ class TestTagFormMatrixE2E:
         plugin = make_plugin(audit_dir=tmp_path)
 
         ev = FakeEvent(chain=[Plain("开头[at:12"), Plain("3]结尾")])
-        await plugin.process_at_tags(ev)
+        ti.trust_ids(plugin, ev, "123")
+        await ti.run_main_hook(plugin, ev)
         assert _ats(ev.get_result().chain) == ["123"]
         assert_n1(ev.get_result().chain)
 
         ev2 = FakeEvent(chain=[Plain("开头[at:12"), At(qq="888"), Plain("3]结尾")])
-        await plugin.process_at_tags(ev2)
+        ti.trust_ids(plugin, ev2, "123")
+        await ti.run_main_hook(plugin, ev2)
         chain2 = ev2.get_result().chain
         assert _ats(chain2) == ["123", "888"]
         assert_n1(chain2)
@@ -235,7 +238,7 @@ class TestTagFormMatrixE2E:
         """P1-1：同一链内多处零宽污染标签必须全部恢复（不再只救一个）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[at:11\u200b1] 和 [at:22\u200b2]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert _ats(chain) == ["111", "222"]
@@ -246,7 +249,7 @@ class TestTagFormMatrixE2E:
         plugin = make_plugin(audit_dir=tmp_path)
         for raw in ("[at:[at:123]", "[at:柴郡[at:123]"):
             ev = FakeEvent(chain=[Plain(raw)])
-            await plugin.process_at_tags(ev)
+            await ti.run_main_hook(plugin, ev)
             assert_n1(ev.get_result().chain)
 
     async def test_send_path_form_matrix(self, tmp_path):
@@ -258,6 +261,7 @@ class TestTagFormMatrixE2E:
         seg = MessageChainStub(
             [Plain("A[At:10001]B[at：10002]C[at:柴郡]D[at:１２３]E")]
         )
+        ti.trust_ids(plugin, ev, "10001", "10002")
         await ev.send(seg)
 
         chain = seg.chain
@@ -283,7 +287,7 @@ class TestTagFormMatrixE2E:
         origin = Plain("前置 [At:10001] 后置")
         chain = [origin]
         ev = FakeEvent(chain=chain)
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         assert origin.text == "前置 [At:10001] 后置", "输入 Plain 不得被原地改写"
         assert _ats(ev.get_result().chain) == ["10001"]
@@ -295,13 +299,279 @@ class TestTagFormMatrixE2E:
         )
         origin = Plain("前置 [At:10001] 后置")
         ev = FakeEvent(chain=[origin])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         assert origin.text == "前置 [At:10001] 后置"
         chain = ev.get_result().chain
         # 标签被删除，其两侧空白原样保留（与旧行为一致，只是不再残留语法）
         assert "".join(_plain_texts(chain)) == "前置  后置"
         assert_n1(chain)
+
+
+class TestTrustedIdSource:
+    """T10：只有「工具确认过的 ID」与「用户消息里出现的 QQ 号」才能渲染为 At。
+
+    线上实测（19:39，群 744868236）：模型未调用任何工具却自行输出
+    ``[at:2060958352]``（发送者自己的 QQ）与 ``[at:3882563785]``（他人），
+    插件照单渲染 → 误伤无关成员。本组用例把「ID 可信来源」钉死。
+    """
+
+    # 线上实测的两个 ID：前者=发送者自己（误艾特），后者=群成员但来源不明
+    FABRICATED = ("2060958352", "3882563785")
+
+    async def test_fabricated_ids_never_render(self, monkeypatch, tmp_path):
+        """编造 ID（无工具调用、用户消息里也没有该号）→ 降级为 @载荷，不渲染。"""
+        warnings = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(
+            chain=[
+                Plain(
+                    f"好的 [at:{self.FABRICATED[0]}] 还有 [at:{self.FABRICATED[1]}] 来了"
+                )
+            ]
+        )
+        ev.message_str = "帮我看看群里谁在"  # 用户消息里没有任何 QQ 号
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "编造 ID 不得渲染成真实艾特"
+        joined = "".join(_plain_texts(chain))
+        for uid in self.FABRICATED:
+            assert f"@{uid}" in joined, joined
+        assert any("未经工具确认" in str(w) for w in warnings), warnings
+        assert_n1(chain)
+        # 没有真实艾特 → 不得写审计
+        assert not audit_file(tmp_path, datetime.now().strftime("%Y%m%d")).exists()
+
+    async def test_tool_confirmed_id_renders(self, tmp_path):
+        """工具命中过的 ID（search_and_mention 唯一命中）→ 正常渲染。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(chain=[])
+        ev.message_str = "帮我艾特一下陨落星辰"
+        ev.bot.member_list = [
+            {
+                "user_id": self.FABRICATED[1],
+                "nickname": "陨落星辰",
+                "card": "",
+                "role": "member",
+            }
+        ]
+        text = await plugin.search_and_mention(ev, "陨落星辰")
+        assert self.FABRICATED[1] in text
+
+        ev.set_chain([Plain(f"来了 [at:{self.FABRICATED[1]}]")])
+        await plugin.process_at_tags(ev)
+        assert _ats(ev.get_result().chain) == [self.FABRICATED[1]]
+        assert_n1(ev.get_result().chain)
+
+    async def test_user_message_qq_renders_when_direct_allowed(self, tmp_path):
+        """用户消息里明确给出的 QQ 号（allow_direct_qq_at=true）→ 正常渲染。"""
+        # (a) 来源是 event.message_str
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(chain=[Plain(f"来了 [at:{self.FABRICATED[1]}]")])
+        ev.message_str = f"帮我艾特 {self.FABRICATED[1]} 谢谢"
+        await plugin.process_at_tags(ev)
+        assert _ats(ev.get_result().chain) == [self.FABRICATED[1]]
+
+        # (b) 来源是入站消息链里的 Plain 文本
+        plugin2 = make_plugin(
+            config={"allow_direct_qq_at": True}, audit_dir=tmp_path
+        )
+        ev2 = FakeEvent(
+            chain=[Plain(f"[At:{self.FABRICATED[0]}] 已通知")],
+            incoming=[Plain(f"艾特下 {self.FABRICATED[0]}")],
+        )
+        ev2.message_str = ""  # 入站链存在即视为有用户上下文
+        await plugin2.process_at_tags(ev2)
+        assert _ats(ev2.get_result().chain) == [self.FABRICATED[0]]
+
+    async def test_direct_qq_not_trusted_when_switch_off(self, tmp_path):
+        """allow_direct_qq_at=false：用户给的号也不可信，必须走工具路径。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": False}, audit_dir=tmp_path)
+        ev = FakeEvent(chain=[Plain(f"来了 [at:{self.FABRICATED[1]}]")])
+        ev.message_str = f"帮我艾特 {self.FABRICATED[1]} 谢谢"
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "关闭直连后仍不得凭用户消息渲染"
+        assert f"@{self.FABRICATED[1]}" in "".join(_plain_texts(chain))
+
+        # 走工具确认后同样可渲染
+        ev.bot.member_list = [
+            {
+                "user_id": self.FABRICATED[1],
+                "nickname": "陨落星辰",
+                "card": "",
+                "role": "member",
+            }
+        ]
+        await plugin.search_and_mention(ev, "陨落星辰")
+        ev.set_chain([Plain(f"来了 [at:{self.FABRICATED[1]}]")])
+        await plugin.process_at_tags(ev)
+        assert _ats(ev.get_result().chain) == [self.FABRICATED[1]]
+
+    async def test_selected_member_id_renders(self, tmp_path):
+        """select_member_by_index 选定过的 ID → 计入可信来源，可渲染。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(chain=[])
+        ev.message_str = "帮我艾特第二个"
+        ev.bot.member_list = [
+            {"user_id": "111", "nickname": "张三", "card": "", "role": "member"},
+            {"user_id": self.FABRICATED[1], "nickname": "张三丰", "card": "", "role": "member"},
+        ]
+        listed = await plugin.search_and_mention(ev, "张")
+        assert "找到多个" in listed
+        selected = await plugin.select_member_by_index(ev, 2)
+        assert self.FABRICATED[1] in selected
+
+        ev.set_chain([Plain(f"就是他了 [at:{self.FABRICATED[1]}]")])
+        await plugin.process_at_tags(ev)
+        assert _ats(ev.get_result().chain) == [self.FABRICATED[1]]
+
+    async def test_short_number_in_message_is_not_a_qq_source(self, tmp_path):
+        """用户消息里的 4 位数字不是 QQ 来源（需 5..12 位），不得据此渲染。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(chain=[Plain("[at:1234]")])
+        ev.message_str = "订单号 1234 帮我艾特一下"
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain)
+        assert "@1234" in "".join(_plain_texts(chain))
+
+    async def test_other_sender_write_does_not_downgrade_mine(self, tmp_path):
+        """T14/A3-①：乙的工具命中不得覆盖甲的可信 ID，甲仍可渲染为 At。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        members = [
+            {"user_id": self.FABRICATED[0], "nickname": "张三", "card": "", "role": "member"},
+            {"user_id": self.FABRICATED[1], "nickname": "李四", "card": "", "role": "member"},
+        ]
+        ev_a = FakeEvent(group_id="1000", sender_id="10001", chain=[])
+        ev_a.message_str = "帮我艾特张三"
+        ev_a.bot.member_list = members
+        await plugin.search_and_mention(ev_a, "张三")
+
+        ev_b = FakeEvent(group_id="1000", sender_id="20002", chain=[])
+        ev_b.message_str = "帮我艾特李四"
+        ev_b.bot.member_list = members
+        await plugin.search_and_mention(ev_b, "李四")
+
+        ev_a.set_chain([Plain(f"[at:{self.FABRICATED[0]}]")])
+        await plugin.process_at_tags(ev_a)
+        assert _ats(ev_a.get_result().chain) == [self.FABRICATED[0]], (
+            "乙写入后甲的工具确认结果必须仍有效（T14/A3：各持一条）"
+        )
+
+    async def test_other_sender_write_keeps_my_fallback_injection(self, tmp_path):
+        """T14/A3-②：乙写入后，甲的兜底补插仍能渲染出 At（不丢艾特）。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        members = [
+            {"user_id": self.FABRICATED[0], "nickname": "张三", "card": "", "role": "member"},
+            {"user_id": self.FABRICATED[1], "nickname": "李四", "card": "", "role": "member"},
+        ]
+        ev_a = FakeEvent(group_id="1000", sender_id="10001", chain=[])
+        ev_a.message_str = "帮我艾特张三"
+        ev_a.bot.member_list = members
+        await plugin.search_and_mention(ev_a, "张三")  # 唯一命中 → 写甲的兜底缓存
+
+        ev_b = FakeEvent(group_id="1000", sender_id="20002", chain=[])
+        ev_b.message_str = "帮我艾特李四"
+        ev_b.bot.member_list = members
+        await plugin.search_and_mention(ev_b, "李四")  # 乙的写入不得冲掉甲的
+
+        ev_a.set_chain([Plain("好的，这就喊他")])  # 模型漏写标签 → 走兜底补插
+        await plugin.process_at_tags(ev_a)
+        assert _ats(ev_a.get_result().chain) == [self.FABRICATED[0]], (
+            "乙写入后甲的兜底补插不得丢失（T14/A3）"
+        )
+
+    async def test_known_ids_expire_and_are_capped(self, tmp_path):
+        """会话级已知 ID 记忆：过期即失效；会话数受容量上限约束（不无界增长）。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(chain=[Plain(f"[at:{self.FABRICATED[1]}]")])
+        ev.message_str = "在吗"
+        # 已过期（> TTL）→ 不信任
+        plugin._known_at_ids[(ev.unified_msg_origin, "10001")] = (
+            {self.FABRICATED[1]},
+            time.time() - 121,
+        )
+        await plugin.process_at_tags(ev)
+        assert not any(isinstance(c, At) for c in ev.get_result().chain)
+        assert f"@{self.FABRICATED[1]}" in "".join(_plain_texts(ev.get_result().chain))
+
+        # 容量上限：逐会话写入超过上限后，最早的会话被淘汰
+        plugin2 = make_plugin(audit_dir=tmp_path)
+        cap = main_mod._MAX_TRUSTED_SLOTS
+        plugin2.bot_sender = None
+        for i in range(cap + 3):
+            ev_i = FakeEvent(group_id=f"9{i}", sender_id="10001", chain=[])
+            ev_i.message_str = "帮我艾特张三"
+            ev_i.bot.member_list = [
+                {"user_id": "1", "nickname": "张三", "card": "", "role": "member"}
+            ]
+            await plugin2.search_and_mention(ev_i, "张三")
+        assert len(plugin2._known_at_ids) <= cap
+        assert ("aiocqhttp:GroupMessage:90", "10001") not in plugin2._known_at_ids
+
+    async def test_known_ids_are_sender_bound_same_umo(self, tmp_path):
+        """同群不同用户不得串用（沿用 F1 的 sender 绑定语义）。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev_a = FakeEvent(group_id="1000", sender_id="10001", chain=[])
+        ev_a.message_str = "帮我艾特张三"
+        ev_a.bot.member_list = [
+            {
+                "user_id": self.FABRICATED[1],
+                "nickname": "张三",
+                "card": "",
+                "role": "member",
+            }
+        ]
+        await plugin.search_and_mention(ev_a, "张三")
+
+        ev_a.set_chain([Plain(f"来了 [at:{self.FABRICATED[1]}]")])
+        await plugin.process_at_tags(ev_a)
+        assert _ats(ev_a.get_result().chain) == [self.FABRICATED[1]]
+
+        ev_b = FakeEvent(
+            group_id="1000",
+            sender_id="20002",
+            chain=[Plain(f"来了 [at:{self.FABRICATED[1]}]")],
+        )
+        ev_b.message_str = "我也说一句"
+        await plugin.process_at_tags(ev_b)
+        assert not any(isinstance(c, At) for c in ev_b.get_result().chain), (
+            "同一 UMO 下另一用户不得借用他人工具确认过的 ID"
+        )
+
+    async def test_no_user_context_still_degrades_fabricated_id(
+        self, monkeypatch, tmp_path
+    ):
+        """fail-closed（T14/B1）：取不到用户上下文时可信集退化为工具确认集，
+
+        编造 ID 仍必须降级为 `@载荷` 并留聚合 warning —— 绝不因"读不到用户
+        消息"而放行。真实宿主 `message_str`/`get_messages()` 恒可用，本用例
+        覆盖的是"宿主/测试桩未暴露用户消息"这一最坏情形。
+        """
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(chain=[Plain(f"[at:{self.FABRICATED[1]}]")])
+        assert getattr(ev, "message_str", "") == ""
+        assert ev.get_messages() == []
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), (
+            "无用户上下文时编造 ID 也必须降级（fail-closed）"
+        )
+        assert f"@{self.FABRICATED[1]}" in "".join(_plain_texts(chain))
+        assert any("未经工具确认" in str(w) for w in warnings), warnings
 
 
 class TestStreamingFormRows:
@@ -316,6 +586,7 @@ class TestStreamingFormRows:
         async def gen():
             yield MessageChainStub([Plain("[At:10001]来啦")])
 
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send_streaming(gen())
         assert _ats(ev.sent[0].chain) == ["10001"]
         assert_n1(ev.sent[0].chain)

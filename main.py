@@ -27,6 +27,7 @@ from .utils import (
     format_single_member_result,
     has_at_tag,
     is_at_all_in_cooldown,
+    USER_QQ_PATTERN,
     parse_at_tag_payload,
     split_text_by_at_tags,
 )
@@ -43,6 +44,9 @@ _FALLBACK_AT_TTL: float = 120.0  # 兜底补插缓存 TTL（秒，修复 2）：
 # 唯一命中后，若 LLM 最终回复缺 [at:ID] 标签，process_at_tags 在 TTL 内自动补插
 _MAX_MULTI_MATCHES: int = 30  # 命中成员过多时拒绝列出，提示细化关键词
 _MEMBER_LIST_MAX_RETRIES: int = 1  # 群成员列表拉取失败后的重试次数（P2-7）
+# T10：会话级"工具确认过的艾特 ID"记忆的 TTL 与容量（与兜底/待选缓存同款治理）
+_KNOWN_AT_ID_TTL: float = 120.0  # 秒；与 _FALLBACK_AT_TTL/_PENDING_CHOICE_TTL 一致
+_MAX_TRUSTED_SLOTS: int = 500  # (会话, 发起者) 槽位上限，超限淘汰最早写入（CHG-07）
 _MEMBER_LIST_RETRY_DELAY: float = 0.5  # 重试间隔（秒，P2-7）
 
 # 审计操作类型枚举（CHG-03）
@@ -182,15 +186,19 @@ class LLMAtToolPlugin(Star):
         self._at_all_last_trigger: dict[str, float] = {}
         # 会话级多结果待选：key=unified_msg_origin, value=(matches, created_ts)
         self._pending_choices: dict[str, Tuple[list, float]] = {}
-        # 兜底补插缓存（修复 2）：key=unified_msg_origin,
-        # value=(sender_id, user_id, created_ts)——绑定发起者，防止同群
-        # 其它用户的回复被补插他人找到的成员（r2 评审 F1）
-        self._fallback_at: dict[str, Tuple[str, str, float]] = {}
+        # 兜底补插缓存（修复 2 + T14/A3）：key=(unified_msg_origin, sender_id),
+        # value=(user_id, created_ts)——同群不同用户各持一条，互不覆盖；
+        # 他人回复既读不到也清不掉本发起者的缓存（r2/F1 + t12 M1）
+        self._fallback_at: dict[tuple[str, str], tuple[str, float]] = {}
         # 工具缺席告警去重（P0-4）：key=unified_msg_origin，每会话只告警一次
         self._tool_absent_warned: set = set()
         # "艾特意图未被满足"告警去重（r2 评审 F8）：key=unified_msg_origin，
         # 每会话只记一次；与 _tool_absent_warned 同形，规模受会话数约束
         self._intent_unmet_warned: set = set()
+        # T10 可信 ID 记忆（T14/A3 起按发起者分槽）：key=(umo, sender_id),
+        # value=({工具确认过的 ID...}, created_ts)。同群不同用户各持一条，
+        # 乙的一次工具命中不会覆盖甲的条目；容量/过期沿用既有缓存治理函数
+        self._known_at_ids: dict[tuple[str, str], tuple[set, float]] = {}
 
         # 审计目录（获取失败时审计降级跳过，不阻断消息流）
         self._audit_dir: Optional[object] = None
@@ -225,6 +233,22 @@ class LLMAtToolPlugin(Star):
     # ------------------------------------------------------------------ #
     # 会话准入（CHG-02 精确匹配）
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _sender_key(event: AstrMessageEvent) -> Tuple[str, str]:
+        """构造"会话 + 发起者"维度的缓存 key（T14/A3）。
+
+        `_known_at_ids`（工具确认过的 ID）与 `_fallback_at`（兜底补插）共用
+        该 key：同群不同用户各持一条，既不会互相覆盖、也无法读到或清掉对方的
+        条目（越权艾特与"合法艾特被降级"两个方向都被堵住）。
+
+        Args:
+            event: 当前消息事件。
+
+        Returns:
+            (unified_msg_origin, sender_id)；发起者缺失时 sender 为空串。
+        """
+        return (event.unified_msg_origin, str(event.get_sender_id() or ""))
+
     def _is_session_allowed(self, event: AstrMessageEvent) -> Tuple[bool, str]:
         return check_session_lists(
             whitelist=self.session_whitelist,
@@ -556,30 +580,31 @@ class LLMAtToolPlugin(Star):
         """
         setattr(event, "_attool_tool_called", True)
         umo = event.unified_msg_origin
+        key = self._sender_key(event)
         allowed, deny_reason = self._is_session_allowed(event)
         if not allowed:
             # 修复 2：最新一次搜索未解析出唯一成员，清除兜底缓存避免误艾特
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return f"【拒绝】{deny_reason}"
 
         group_id = event.get_group_id()
         if not group_id:
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return "【错误】当前不在群聊环境中。"
         if not _is_aiocqhttp_event(event):
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return "【错误】当前平台暂不支持此功能。"
 
         try:
             name_str = name or ""
             if not name_str.strip():
                 # P2-2：空搜索词时 "" in nickname 恒为 True，会误命中全部成员
-                self._fallback_at.pop(umo, None)
+                self._fallback_at.pop(key, None)
                 return "【错误】搜索词为空，请提供要搜索的成员昵称或群名片。"
 
             raw_members = await self._get_group_members_cached(event, group_id)
             if not raw_members:
-                self._fallback_at.pop(umo, None)
+                self._fallback_at.pop(key, None)
                 return "【错误】无法获取群成员列表。"
 
             def _collect(term: str) -> Tuple[list, list]:
@@ -621,7 +646,7 @@ class LLMAtToolPlugin(Star):
 
             if not matches:
                 mode = "包含" if self.enable_fuzzy_search else "完全匹配"
-                self._fallback_at.pop(umo, None)
+                self._fallback_at.pop(key, None)
                 logger.info(
                     f"[AtTool] search_and_mention 未命中: 关键词=「{name_str}」"
                     f"（{mode}匹配，会话 {umo}）"
@@ -629,7 +654,7 @@ class LLMAtToolPlugin(Star):
                 return f"【未找到】群聊中没有找到名称{mode}「{name_str}」的成员。"
 
             if len(matches) > _MAX_MULTI_MATCHES:
-                self._fallback_at.pop(umo, None)
+                self._fallback_at.pop(key, None)
                 return (
                     f"【提示】名称包含「{name_str}」的成员过多（共 {len(matches)} 个），"
                     "请让用户提供更精确的姓名或群名片后再搜索。"
@@ -641,12 +666,17 @@ class LLMAtToolPlugin(Star):
                 # process_at_tags 自动补插 [at:ID]
                 # r2（评审 F1）：缓存绑定本次发起者 sender_id，宿主按事件
                 # 并发，同群他人回复不得被补插本成员
-                self._fallback_at[umo] = (
-                    str(event.get_sender_id() or ""),
-                    user_id,
-                    time.time(),
-                )
-                drop_expired(self._fallback_at, _FALLBACK_AT_TTL, time.time())
+                now = time.time()
+                self._fallback_at[key] = (user_id, now)
+                drop_expired(self._fallback_at, _FALLBACK_AT_TTL, now)
+                evict_oldest_to_limit(self._fallback_at, _MAX_TRUSTED_SLOTS)
+                # T10：登记"工具确认过的 ID"，供最终渲染做来源判定
+                cached_ids = self._known_at_ids.get(key)
+                known = set(cached_ids[0]) if cached_ids else set()
+                known.add(user_id)
+                self._known_at_ids[key] = (known, now)
+                drop_expired(self._known_at_ids, _KNOWN_AT_ID_TTL, now)
+                evict_oldest_to_limit(self._known_at_ids, _MAX_TRUSTED_SLOTS)
                 logger.info(
                     f"[AtTool] search_and_mention 命中: {display_name} ({user_id}，"
                     f"{role}，会话 {umo})"
@@ -655,7 +685,7 @@ class LLMAtToolPlugin(Star):
 
             # 多结果：需用户选择序号后经 select_member_by_index 选定，
             # 不写入兜底缓存（多成员匹配不兜底，修复 2）
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             self._pending_choices[umo] = (matches, time.time())
             drop_expired(self._pending_choices, _PENDING_CHOICE_TTL, time.time())
             # P2-3：待选缓存同样受容量上限约束（对称 CHG-07 治理）
@@ -664,7 +694,7 @@ class LLMAtToolPlugin(Star):
 
         except Exception as exc:
             logger.error(f"search_and_mention 异常: {exc}")
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return f"【错误】搜索时发生异常: {str(exc)}"
 
     # ------------------------------------------------------------------ #
@@ -707,6 +737,14 @@ class LLMAtToolPlugin(Star):
                 "请提示用户在范围内重新选择。"
             )
         user_id, display_name, role = matches[idx - 1]
+        # T10：用户选定（工具确认）的 ID 同样计入可信来源（按发起者分槽）
+        key = self._sender_key(event)
+        cached_ids = self._known_at_ids.get(key)
+        known = set(cached_ids[0]) if cached_ids else set()
+        known.add(user_id)
+        self._known_at_ids[key] = (known, now)
+        drop_expired(self._known_at_ids, _KNOWN_AT_ID_TTL, now)
+        evict_oldest_to_limit(self._known_at_ids, _MAX_TRUSTED_SLOTS)
         return format_single_member_result(
             display_name, user_id, role, prefix="已选定："
         )
@@ -736,26 +774,23 @@ class LLMAtToolPlugin(Star):
         缓存为一次性消费：无论是否补插，读取后即删除，防止跨轮次误用。
         """
         umo = event.unified_msg_origin
+        key = self._sender_key(event)
         now = time.time()
-        cached = self._fallback_at.get(umo)
+        cached = self._fallback_at.get(key)
         if not cached or (now - cached[-1]) >= _FALLBACK_AT_TTL:
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return False
-        sender_id, user_id, _ = cached
-        if sender_id != str(event.get_sender_id() or ""):
-            # 同群另一用户的事件：不得替他人补插（缓存一次性消费）
-            self._fallback_at.pop(umo, None)
-            return False
+        user_id = cached[0]
         # 链中已有其他来源插入的 At 组件时不再兜底（避免重复艾特）
         if any(isinstance(comp, At) for comp in chain):
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return False
         # 会话准入：不允许艾特的会话不兜底
         allowed, _ = self._is_session_allowed(event)
         if not allowed:
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(key, None)
             return False
-        self._fallback_at.pop(umo, None)
+        self._fallback_at.pop(key, None)
         chain.append(Plain(f"[at:{user_id}]"))
         logger.warning(
             f"兜底补插 [at:{user_id}]：LLM 回复未携带艾特标签（会话 {umo}）"
@@ -786,7 +821,7 @@ class LLMAtToolPlugin(Star):
             # 链空时解除兜底缓存：本钩子无法履行补插义务，而 send 路径刻意
             # 不消费缓存（P0-2）；若此处不清理，缓存会残留满 TTL(120s)，
             # 新一轮无标签回复会误补插上一轮成员（跨轮次误艾特）。
-            self._fallback_at.pop(event.unified_msg_origin, None)
+            self._fallback_at.pop(self._sender_key(event), None)
             return
         rendered, new_chain = await self._render_at_tags(
             event, result.chain, enable_fallback=True
@@ -828,6 +863,12 @@ class LLMAtToolPlugin(Star):
         保证各路径的形态归一 / 会话准入 / @全体权限+冷却 / 审计 / 零宽清理
         语义一致；标签语法解析统一委托 utils（P0-5 单一事实来源）。
 
+        T10 成员 ID 可信来源约束：只有「本会话内工具确认过的 ID」
+        （`_known_at_ids`，绑定发起者）与「用户消息里出现的 QQ 号」
+        （`allow_direct_qq_at=true` 时）才渲染为 At，其余按 degrade 语义降级为
+        纯文本 `@载荷` 并聚合一条 warning —— 模型凭空的 `[at:<QQ>]`
+        （线上实测 [at:2060958352]/[at:3882563785]）不再误伤无关成员。
+
         Args:
             event: 当前消息事件（会话准入、@全体权限、审计依赖）。
             chain: 待渲染的消息链组件列表（调用方保证非空）。
@@ -845,6 +886,32 @@ class LLMAtToolPlugin(Star):
             原链无需改动。
         """
         umo = event.unified_msg_origin
+
+        # ⓪ 成员 ID 可信来源判定（T10 / T14-B1 fail-closed）：只认两类 ID——
+        #    (a) 本会话内工具确认过的（_known_at_ids，按发起者分槽）；
+        #    (b) 用户消息里明确出现的 QQ 号（allow_direct_qq_at=true 时）。
+        #    取不到用户上下文（无 message_str 也无入站链）时可信集退化为 (a)，
+        #    编造 ID 一律降级 —— 绝不因"读不到用户消息"而放行（T12 B1）。
+        #    该可信集必须早于 ①b 跨组件拼合构造，供拼合路径共用同一份判定
+        #    （T12 B2）。
+        trusted_ids: set = set()
+        now = time.time()
+        cached_ids = self._known_at_ids.get(self._sender_key(event))
+        if cached_ids and (now - cached_ids[-1]) < _KNOWN_AT_ID_TTL:
+            trusted_ids |= cached_ids[0]
+        msg_text = getattr(event, "message_str", "") or ""
+        try:
+            incoming = event.get_messages()
+        except Exception:
+            incoming = None
+        if self.allow_direct_qq_at:
+            if msg_text:
+                trusted_ids |= set(USER_QQ_PATTERN.findall(msg_text))
+            for in_comp in incoming or []:
+                if isinstance(in_comp, Plain):
+                    trusted_ids |= set(USER_QQ_PATTERN.findall(in_comp.text))
+        # 未经工具确认 / 未出现在用户消息里的成员 ID（聚合告警用）
+        untrusted_ids: list[str] = []
 
         # ① 合并相邻 Plain：修复标签被第三方插件拆分到相邻组件的情况
         #    （如 "[at:12" 与 "345]" 分处两个 Plain，合并后可完整匹配）。
@@ -864,10 +931,14 @@ class LLMAtToolPlugin(Star):
             else:
                 merged_input.append(comp)
 
-        # ①b 跨组件拼合（P0-1）："[at:12" 与 "345]" 之间夹着 At 等非 Plain
-        #     组件时，步骤①的相邻合并救不了；先拼回完整标签再统一解析，
-        #     否则前缀会被当成"未闭合语法"删除、艾特丢失（spec §7.2 第 13 行）
-        reassembled = self._merge_split_at_tags(merged_input, umo)
+        # ①b 跨组件拼合（P0-1 + T14-B2）："[at:12" 与 "345]" 之间夹着 At 等
+        #     非 Plain 组件时，步骤①的相邻合并救不了；先拼回完整标签再统一
+        #     解析，否则前缀会被当成"未闭合语法"删除、艾特丢失（spec §7.2
+        #     第 13 行）。拼出的成员 ID 必须过同一份 trusted_ids：不可信时
+        #     按 degrade 语义降级为 @载荷（不渲染、也不静默删除）
+        reassembled = self._merge_split_at_tags(
+            merged_input, umo, trusted_ids, untrusted_ids
+        )
         if reassembled is not None:
             merged_input = reassembled
 
@@ -894,10 +965,11 @@ class LLMAtToolPlugin(Star):
                 return False, chain
         elif enable_fallback:
             # 回复已含标签：本次兜底义务解除（仅主钩子消费清理缓存）
-            self._fallback_at.pop(umo, None)
+            self._fallback_at.pop(self._sender_key(event), None)
 
         if not has_tag:
-            # 仅发生跨组件拼合（P0-1）：标签已在 ①b 渲染为 At，仍需返回重建链
+            # 仅发生跨组件拼合（P0-1）：标签已在 ①b 渲染/降级，仍需返回重建链
+            self._warn_untrusted_at_ids(untrusted_ids, umo)
             return True, self._finalize_chain(merged_input)
 
         # ③ 会话准入：不允许则统一按 P0-1 语义降级（成员标签剥离、@全体转
@@ -922,6 +994,7 @@ class LLMAtToolPlugin(Star):
                         kept.append("@全体成员")
                     # 成员标签 / 空载荷 / 未闭合语法：删除标签语法
                 degraded.append(Plain("".join(kept)))
+            self._warn_untrusted_at_ids(untrusted_ids, umo)
             return True, self._finalize_chain(degraded)
 
         # ④ @全体 权限 + 频率一次性判定（CHG-01 / CHG-03）
@@ -941,7 +1014,9 @@ class LLMAtToolPlugin(Star):
                 elif self.at_all_cooldown > 0:
                     self._record_at_all_trigger(event)
 
-        # ⑤ 逐组件解析标签并渲染（共用 utils 单一解析实现，B2/B5 一并收敛）
+        # ⑤b 逐组件解析标签并渲染（共用 utils 单一解析实现，B2/B5 一并收敛）；
+        #     trusted_ids / untrusted_ids 已在 ⓪ 步骤构造（T14：早于跨组件拼合，
+        #     两条路径共用同一份可信集）
         new_chain: List[BaseMessageComponent] = []
         at_member_targets: List[str] = []
         for comp in merged_input:
@@ -975,9 +1050,15 @@ class LLMAtToolPlugin(Star):
                         new_chain.append(At(qq="all"))
                     else:
                         new_chain.append(Plain("@全体成员"))
+                elif value not in trusted_ids:
+                    # T10：编造/上游残留的 ID 不得渲染成真实艾特（误伤无关成员）
+                    untrusted_ids.append(value)
+                    new_chain.append(Plain("@" + value))
                 else:
                     new_chain.append(At(qq=value))
                     at_member_targets.append(value)
+
+        self._warn_untrusted_at_ids(untrusted_ids, umo)
 
         # ⑥ 审计写入：@单人逐条（同一事件同一目标只记一次，P1-4）+
         #    @全体整体一条（CHG-03）
@@ -1023,8 +1104,28 @@ class LLMAtToolPlugin(Star):
             )
         return True, new_chain
 
+    @staticmethod
+    def _warn_untrusted_at_ids(untrusted_ids: list, umo: str) -> None:
+        """对"未经工具确认的艾特 ID"聚合告警（每轮渲染至多一条）。
+
+        Args:
+            untrusted_ids: 本轮渲染中被判为不可信的成员 ID（可为空）。
+            umo: 当前会话标识。
+        """
+        if not untrusted_ids:
+            return
+        logger.warning(
+            "检测到未经工具确认的艾特 ID（疑似编造/上游残留），已降级为纯文本 "
+            f"@{'、@'.join(dict.fromkeys(untrusted_ids))}"
+            f"（会话 {umo}；本轮用户消息与工具结果均未提供该 ID）"
+        )
+
     def _merge_split_at_tags(
-        self, chain: list[BaseMessageComponent], umo: str
+        self,
+        chain: list[BaseMessageComponent],
+        umo: str,
+        trusted_ids: set,
+        untrusted_ids: list,
     ) -> list[BaseMessageComponent] | None:
         """P0-1 跨组件拼合：把被非 Plain 组件切碎的标签拼回并渲染为 At。
 
@@ -1040,6 +1141,8 @@ class LLMAtToolPlugin(Star):
         Args:
             chain: 已合并相邻 Plain 的消息链。
             umo: 当前会话标识（仅用于告警日志）。
+            trusted_ids: 与逐组件路径共用的同一份可信 ID 集合（T14-B2）。
+            untrusted_ids: 本轮渲染中不可信 ID 的聚合列表（调用方负责告警）。
 
         Returns:
             重建后的链；无需拼合时返回 None（调用方保持原链不变）。
@@ -1053,7 +1156,9 @@ class LLMAtToolPlugin(Star):
             for idx, comp in enumerate(working):
                 if not isinstance(comp, Plain) or not has_at_tag(comp.text):
                     continue
-                hit = self._try_merge_split_at_tag(working, idx, umo)
+                hit = self._try_merge_split_at_tag(
+                    working, idx, umo, trusted_ids, untrusted_ids
+                )
                 if hit is not None:
                     break
             if hit is None:
@@ -1063,7 +1168,12 @@ class LLMAtToolPlugin(Star):
         return working if recovered else None
 
     def _try_merge_split_at_tag(
-        self, chain: list[BaseMessageComponent], idx: int, umo: str
+        self,
+        chain: list[BaseMessageComponent],
+        idx: int,
+        umo: str,
+        trusted_ids: set,
+        untrusted_ids: list,
     ) -> list[BaseMessageComponent] | None:
         """尝试用 chain[idx] 起的跨组件文本拼出一个完整成员标签（P0-1）。
 
@@ -1075,6 +1185,8 @@ class LLMAtToolPlugin(Star):
             chain: 当前消息链。
             idx: 起始语法所在 Plain 的下标。
             umo: 当前会话标识（仅用于告警日志）。
+            trusted_ids: 与逐组件路径共用的同一份可信 ID 集合（T14-B2）。
+            untrusted_ids: 不可信 ID 聚合列表（本函数只追加，调用方统一告警）。
 
         Returns:
             重建后的链；无法拼合时返回 None。
@@ -1115,12 +1227,17 @@ class LLMAtToolPlugin(Star):
             kind, target_id = parse_at_tag_payload(match.group(1))
             if kind != "at" or target_id == "all":
                 continue
+            # T14-B2：拼出的成员 ID 必须过与逐组件路径同一份可信集；
+            # 不可信 → 原位降级为 @载荷（保留数字文本，不渲染 At）
+            trusted = target_id in trusted_ids
+            if not trusted:
+                untrusted_ids.append(target_id)
             # ——重建链：剥离片段、原位插入 At、中间组件保持原序——
             rebuilt: list[BaseMessageComponent] = []
             head_text = text[: head.start()]
             if head_text:
                 rebuilt.append(Plain(head_text))
-            rebuilt.append(At(qq=target_id))
+            rebuilt.append(At(qq=target_id) if trusted else Plain("@" + target_id))
             consumed_map = dict(consumption)
             for j in range(idx + 1, len(chain)):
                 if j in consumed_map:
@@ -1367,4 +1484,5 @@ class LLMAtToolPlugin(Star):
         self._fallback_at.clear()
         self._tool_absent_warned.clear()
         self._intent_unmet_warned.clear()
+        self._known_at_ids.clear()
         logger.info("LLMAtToolPlugin 已清理权限/成员/冷却/待选/兜底缓存并卸载。")

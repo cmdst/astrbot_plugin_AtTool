@@ -50,6 +50,10 @@ _PKG_NAME = "astrbot_plugin_AtTool"
 
 _NAKED_TAG = re.compile(r"\[(?i:at)\s*[:：]")  # N1 判定函数（spec §7.1）
 
+# 真实用户消息的默认内容：**不含任何数字**，避免把"用户给出的 QQ 号"
+# 意外喂给 T10 的可信来源判定（那是专门用例才刻意构造的输入）。
+DEFAULT_USER_MESSAGE = "帮我艾特一下张三"
+
 
 # --------------------------------------------------------------------------- #
 # 1. 最小 astrbot 桩：仅当真实包（或实现者的桩）尚未安装时自建
@@ -122,9 +126,15 @@ def _install_minimal_stub() -> None:
             self.text = text
 
     class At:
+        """与真机语义一致：astrbot At 是 pydantic 模型（qq: int | str），
+        纯数字串会被强制转 int；非数字串（如 all）保留字符串。"""
+
         def __init__(self, qq="", name=""):
-            self.qq = qq
+            self.qq = int(qq) if isinstance(qq, str) and qq.isdigit() else qq
             self.name = name
+
+        def toDict(self):
+            return {"type": "at", "data": {"qq": str(self.qq)}}
 
     class BaseMessageComponent:
         pass
@@ -277,17 +287,34 @@ class DeliveryRecorder:
 
 
 class FakeEvent:
-    """最小事件对象：暴露 bot.api（过 aiocqhttp 鸭子类型判定）与交付路径。"""
+    """最小事件对象：暴露 bot.api（过 aiocqhttp 鸭子类型判定）与交付路径。
+
+    T11 建模修正：真机 `AstrMessageEvent.message_str` 与 `get_messages()` 恒可用
+    （用户那条入站消息），而 T10 的 ID 可信来源判定依赖它们。若事件两者皆空，
+    插件会走"无用户上下文则跳过来源判定"的 fail-open 分支，用例就不再表达真实
+    会话语义。故这里默认构造一条真实入站消息（内容不含数字，避免意外把数字
+    当成用户给出的 QQ）。
+    """
 
     def __init__(self, chain=None, group_id="1035699087", sender_id="10001",
-                 umo=None, bot=None, recorder=None):
+                 umo=None, bot=None, recorder=None,
+                 user_message=DEFAULT_USER_MESSAGE, incoming=None):
         self._group_id = group_id
         self._sender_id = sender_id
         self.unified_msg_origin = umo or f"aiocqhttp:GroupMessage:{group_id}"
         self.bot = bot if bot is not None else FakeBot()
-        self.message_str = ""
+        self.message_str = user_message or ""
+        self._incoming = (
+            list(incoming)
+            if incoming is not None
+            else ([Plain(self.message_str)] if self.message_str else [])
+        )
         self._result = FakeResult(chain)
         self.delivery = recorder if recorder is not None else DeliveryRecorder()
+
+    def get_messages(self):
+        """入站消息链（真机同签名；T10 判定用户是否给出过 QQ 号）。"""
+        return list(self._incoming)
 
     def get_group_id(self):
         return self._group_id
@@ -354,15 +381,69 @@ def make_plugin(recorder=None):
     return plugin
 
 
-def new_plugin_and_event(chain=None, **event_kwargs):
+def mark_tool_confirmed(plugin, event, *ids, fallback: bool = False):
+    """模拟"工具确认过这些 ID"——与 search_and_mention/select_member_by_index
+    的真实写入同形：两个缓存都按 **(umo, sender_id)** 分槽（T14/A3/M1）——
+    `_known_at_ids[(umo, sender)] = ({ids}, now)`；`fallback=True` 时同时写
+    兜底补插缓存 `_fallback_at[(umo, sender)] = (user_id, now)`。
+
+    T10 之后，"工具确认"是 ID 能被渲染成 At 的两条可信来源之一，因此凡是
+    断言"[at:ID] 应渲染"的用例，都必须显式表达这个前提。
+    """
+    umo = event.unified_msg_origin
+    sender = str(event.get_sender_id() or "")
+    now = time.time()
+    key = (umo, sender)
+    cached = plugin._known_at_ids.get(key)
+    known = set(cached[0]) if cached else set()
+    known |= {str(i) for i in ids}
+    plugin._known_at_ids[key] = (known, now)
+    if fallback and ids:
+        plugin._fallback_at[key] = (str(ids[0]), now)
+
+
+def fallback_entry(plugin, event):
+    """读取该事件发起者名下的兜底补插条目（T14/A3 起按 (umo, sender) 分槽）。"""
+    return plugin._fallback_at.get(
+        (event.unified_msg_origin, str(event.get_sender_id() or ""))
+    )
+
+
+def _auto_trusted_ids(chain) -> set:
+    """从初始链里收集所有标签载荷，作为"工具已确认"的模拟前提。
+
+    仅用于形态/分段类用例（它们考察的是标签**形态与投递路径**，把
+    "ID 来源"这一维度固定为可信）；ID 来源本身的用例在
+    TestTrustedIdSourceVerifier 里显式构造不可信输入。
+    """
+    ids = set()
+    for comp in chain or []:
+        if isinstance(comp, Plain) and comp.text:
+            for kind, value in utils_mod.split_text_by_at_tags(comp.text):
+                if kind == "at" and value != "all":
+                    ids.add(value)
+    return ids
+
+
+def new_plugin_and_event(chain=None, *, trusted_ids="auto", **event_kwargs):
     """构造 (plugin, event)，两者共享同一个交付录制器。
 
     AtTool 的 send 包装器与第三方 splitter 的 context.send_message 是两条
     独立投递路径，必须录到同一个 DeliveryRecorder 里才能做"全量交付"断言。
+
+    Args:
+        chain: 初始结果链。
+        trusted_ids: "auto"（默认）= 把初始链里的标签载荷视为"工具已确认"；
+            显式传入集合（含空集）则按传入值登记，用于验证"未确认即不渲染"。
+        **event_kwargs: 透传给 FakeEvent（user_message / incoming / sender_id 等）。
     """
     recorder = DeliveryRecorder()
     plugin = make_plugin(recorder)
     event = FakeEvent(chain=chain, recorder=recorder, **event_kwargs)
+    if trusted_ids == "auto":
+        trusted_ids = _auto_trusted_ids(chain)
+    if trusted_ids:
+        mark_tool_confirmed(plugin, event, *trusted_ids)
     return plugin, event
 
 
@@ -491,7 +572,7 @@ class TestSplitterInterop:
         plugin, event = new_plugin_and_event(chain=[Plain("第一段闲聊\n\n第二段内容\n\n第三段 [at:888]")])
         await run_llm_request(plugin, event)
         # 模拟工具唯一命中 777：修复前 send 路径会用该缓存补插到第一段
-        plugin._fallback_at[event.unified_msg_origin] = ("10001", "777", time.time())
+        mark_tool_confirmed(plugin, event, "10001", fallback=True)
 
         await third_party_clear_and_send_each(plugin, event)
         await run_main_hook(plugin, event)  # 主钩子最后执行（链已空）
@@ -517,15 +598,15 @@ class TestSplitterInterop:
         """send 路径不得消费兜底缓存（P0-2）：缓存只归主钩子。"""
         plugin, event = new_plugin_and_event(chain=[Plain("无标签的一段\n\n第二段")])
         await run_llm_request(plugin, event)
-        plugin._fallback_at[event.unified_msg_origin] = ("10001", "777", time.time())
+        mark_tool_confirmed(plugin, event, "10001", fallback=True)
 
         await third_party_clear_and_send_each(plugin, event)
         assert event.delivery.at_targets() == []
-        assert plugin._fallback_at.get(event.unified_msg_origin) is not None, (
+        assert fallback_entry(plugin, event) is not None, (
             "send 路径不应消费兜底缓存（否则主钩子无标签可补）"
         )
         await run_main_hook(plugin, event)
-        assert plugin._fallback_at.get(event.unified_msg_origin) is None
+        assert fallback_entry(plugin, event) is None
 
     async def test_ii_splitter_real_path_context_send_message(self):
         """(ii) splitter 真实路径：非末段 context.send_message、末段 result.chain。"""
@@ -571,7 +652,10 @@ class TestSplitterInterop:
 
     async def test_iii_tag_split_across_adjacent_plains(self):
         """(iii) 原始标签被切到相邻两个 Plain：必须拼回并渲染为 At。"""
-        plugin, event = new_plugin_and_event(chain=[Plain("你好 [at:12"), Plain("345] 收工")])
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("你好 [at:12"), Plain("345] 收工")],
+            trusted_ids={"12345"},
+        )
         await run_llm_request(plugin, event)
         await run_main_hook(plugin, event)
 
@@ -585,7 +669,10 @@ class TestSplitterInterop:
 
     async def test_iii_tag_split_across_plains_with_middle_component(self):
         """(iii) 变体：标签被 At 组件隔开（跨组件切碎）。"""
-        plugin, event = new_plugin_and_event(chain=[Plain("[at:12"), At(qq="999"), Plain("345]")])
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:12"), At(qq="999"), Plain("345]")],
+            trusted_ids={"12345", "999"},
+        )
         await run_llm_request(plugin, event)
         await run_main_hook(plugin, event)
 
@@ -685,7 +772,7 @@ class TestNakedTagInvariant:
 
     async def test_form_16_streaming_single_chunk_renders(self):
         """形态 16（spec 第 17 行）：单 chunk 内完整标签应渲染。"""
-        plugin, event = new_plugin_and_event(chain=[])
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids={"123"})
         await run_llm_request(plugin, event)
 
         mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
@@ -823,7 +910,8 @@ class TestAdversarialFuzz:
         `_try_merge_split_at_tag` 的累积路径（载荷 3 位，远小于窗口 64）。
         """
         plugin, event = new_plugin_and_event(
-            chain=[Plain("[at:12"), At(qq="999"), Plain("3]")]
+            chain=[Plain("[at:12"), At(qq="999"), Plain("3]")],
+            trusted_ids={"123"},  # 拼出的成员 ID：本用例考察窗口机制，来源维度固定为可信
         )
         await run_llm_request(plugin, event)
         await run_main_hook(plugin, event)
@@ -869,7 +957,9 @@ class TestAdversarialFuzz:
         def build_chain():
             return [Plain("[at:12"), At(qq="999"), Plain("3]")]
 
-        plugin, event = new_plugin_and_event(chain=build_chain())
+        plugin, event = new_plugin_and_event(
+            chain=build_chain(), trusted_ids={"123"}
+        )
         await run_llm_request(plugin, event)
         await run_main_hook(plugin, event)
         assert [
@@ -877,7 +967,9 @@ class TestAdversarialFuzz:
         ] == ["123", "999"]
 
         monkeypatch.setattr(main_mod, "_SPLIT_AT_WINDOW", 1)
-        plugin2, event2 = new_plugin_and_event(chain=build_chain())
+        plugin2, event2 = new_plugin_and_event(
+            chain=build_chain(), trusted_ids={"123"}
+        )
         await run_llm_request(plugin2, event2)
         await run_main_hook(plugin2, event2)
         await framework_deliver_final(event2)
@@ -915,7 +1007,7 @@ class TestPermissionNotBypassed:
         plugin, event = new_plugin_and_event(chain=[Plain("第一段\n\n第二段 [at:123]")])
         plugin.session_blacklist = [event.unified_msg_origin]
         await run_llm_request(plugin, event)
-        plugin._fallback_at[event.unified_msg_origin] = ("10001", "777", time.time())
+        mark_tool_confirmed(plugin, event, "10001", fallback=True)
         await third_party_clear_and_send_each(plugin, event)
 
         assert event.delivery.at_targets() == []
@@ -965,7 +1057,7 @@ class TestStreamingAndDelayedRender:
         """P0-2：流式段无标签时不得补插（基线曾经补插）。"""
         plugin, event = new_plugin_and_event(chain=[])
         await run_llm_request(plugin, event)
-        plugin._fallback_at[event.unified_msg_origin] = ("10001", "777", time.time())
+        mark_tool_confirmed(plugin, event, "10001", fallback=True)
 
         mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
 
@@ -977,12 +1069,12 @@ class TestStreamingAndDelayedRender:
         assert event.delivery.at_targets() == [], (
             f"流式路径不得补插兜底艾特，实测 {event.delivery.at_targets()}"
         )
-        assert plugin._fallback_at.get(event.unified_msg_origin) is not None, (
+        assert fallback_entry(plugin, event) is not None, (
             "流式路径不得消费兜底缓存"
         )
 
     async def test_streaming_per_chunk_renders_own_tag(self):
-        plugin, event = new_plugin_and_event(chain=[])
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids={"111", "222"})
         await run_llm_request(plugin, event)
 
         mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
@@ -1010,7 +1102,7 @@ class TestStreamingAndDelayedRender:
 
     async def test_send_path_does_not_mutate_caller_component(self):
         """P1-3 copy-on-write：send 渲染不得原地改写调用方 Plain。"""
-        plugin, event = new_plugin_and_event(chain=[])
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids={"123"})
         await run_llm_request(plugin, event)
 
         mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
@@ -1097,7 +1189,10 @@ class TestBoundaries:
     async def test_fallback_ttl_expired_no_injection(self):
         plugin, event = new_plugin_and_event(chain=[Plain("本轮没有标签")])
         await run_llm_request(plugin, event)
-        plugin._fallback_at[event.unified_msg_origin] = ("10001", "777", time.time() - 121)
+        plugin._fallback_at[(event.unified_msg_origin, "10001")] = (
+            "777",
+            time.time() - 121,
+        )
         await run_main_hook(plugin, event)
         await framework_deliver_final(event)
 
@@ -1185,3 +1280,523 @@ class TestHarnessSelfCheck:
         assert (Path(main_mod.__file__).resolve().parent == _PLUGIN_ROOT), (
             f"被测插件根不符：{main_mod.__file__} vs {_PLUGIN_ROOT}"
         )
+
+
+# =========================================================================== #
+# T11 追加：跨插件「吞标签」机制复现 + T10 ID 可信来源约束的独立验证
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# 10. 真实 meme_manager 解析器（只读导入；不修改其任何文件）
+# --------------------------------------------------------------------------- #
+_MEME_BACKEND = Path("/root/AstrBot/data/plugins/meme_manager/backend")
+
+# 线上 /root/AstrBot/data/config/meme_manager_config.json 实测取值：
+#   generation.markup.enable_alternative        = true
+#   generation.markup.remove_invalid_alternative= true
+#   generation.markup.enable_repeated_detection = true
+#   generation.markup.filter_all_tags           = false
+#   generation.matching.enable_loose_matching   = true
+# 且 mixins/event_handlers.py:_make_meme_parser 恒传 strip_references=True。
+_MEME_LIVE_OPTS = dict(
+    alternative=True,
+    loose=True,
+    repeated=True,
+    remove_invalid=True,
+    strip_references=True,
+    filter_all=False,
+)
+# 活动表情包分类键（线上不包含 at:xxxx，故任何 [at:...] 都是 invalid 标记）
+_MEME_CATS = {"开心", "疑惑", "无语", "赞同"}
+
+
+def _real_meme_parser():
+    """只读加载真实 MemeParser（离线、无网络无 IO）。"""
+    if not (_MEME_BACKEND / "meme_parser" / "parser.py").exists():
+        pytest.skip("meme_manager/meme_parser 不在本机，跳过上游吞标签复现")
+    if str(_MEME_BACKEND) not in sys.path:
+        sys.path.insert(0, str(_MEME_BACKEND))
+    from meme_parser import MemeParser  # noqa: PLC0415
+
+    return MemeParser
+
+
+def _audit_files(audit_dir) -> list:
+    audit_dir = Path(audit_dir) / "audit"
+    return sorted(audit_dir.glob("at_audit_*.jsonl")) if audit_dir.exists() else []
+
+
+class TestUpstreamSwallowMechanism:
+    """meme_manager 的 on_llm_response（priority=99999）改写 completion_text，
+    在 AtTool 的 on_decorating_result（priority=-1000）之前把标签吞掉。"""
+
+    async def test_production_options_swallow_live_tag_and_keep_spaces(self):
+        MemeParser = _real_meme_parser()
+        src = "好的，这就帮你艾特 [at:2060958352] "
+        out = MemeParser.parse(src, _MEME_CATS, **_MEME_LIVE_OPTS)
+
+        assert "[at:" not in out.text, f"线上组合应吞掉标签，实测 {out.text!r}"
+        assert out.text == "好的，这就帮你艾特  ", (
+            f"标签被删但两侧空白保留（线上同形），实测 {out.text!r}"
+        )
+        assert [tok.kind for tok in out.tokens] == ["bracket"]
+        assert out.tokens[0].valid is False, "at:xxxx 不是有效表情标记"
+
+    async def test_both_live_ids_swallowed(self):
+        MemeParser = _real_meme_parser()
+        src = "先 [at:2060958352] 再 [at:3882563785] 完"
+        out = MemeParser.parse(src, _MEME_CATS, **_MEME_LIVE_OPTS)
+        assert "[at:" not in out.text
+        assert out.text == "先  再  完", f"两个标签都消失，空白保留：{out.text!r}"
+
+    async def test_strip_references_alone_does_not_swallow(self):
+        """解释「有时吞、有时不吞」：单纯 strip_references 不吞标签。"""
+        MemeParser = _real_meme_parser()
+        src = "好的 [at:2060958352] "
+        out = MemeParser.parse(src, _MEME_CATS, strip_references=True)
+        assert out.text == src, f"仅 strip_references 时标签应存活，实测 {out.text!r}"
+
+    async def test_remove_invalid_off_does_not_swallow(self):
+        MemeParser = _real_meme_parser()
+        src = "好的 [at:2060958352] "
+        out = MemeParser.parse(
+            src, _MEME_CATS, **{**_MEME_LIVE_OPTS, "remove_invalid": False}
+        )
+        assert out.text == src, f"关掉 remove_invalid 后标签应存活，实测 {out.text!r}"
+
+    async def test_alternative_off_does_not_swallow(self):
+        MemeParser = _real_meme_parser()
+        src = "好的 [at:2060958352] "
+        out = MemeParser.parse(
+            src, _MEME_CATS, **{**_MEME_LIVE_OPTS, "alternative": False}
+        )
+        assert out.text == src, f"关掉 alternative 后标签应存活，实测 {out.text!r}"
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            "[at:2060958352]", "[At:2060958352]", "[AT:2060958352]",
+            "[at: 2060958352]", "[at：2060958352]", "[at:all]", "[At:All]",
+            "[at:柴郡]", "[at:ID]", "[at 123]", "[avatar:1]", "[at:]",
+        ],
+        ids=lambda f: f"swallow-{abs(len(f))}",
+    )
+    async def test_every_bracket_form_is_swallowed_upstream(self, form):
+        """上游吞的是「任意 [] token」，与是不是合法 AtTool 标签无关。"""
+        MemeParser = _real_meme_parser()
+        out = MemeParser.parse(f"文本{form}后缀", _MEME_CATS, **_MEME_LIVE_OPTS)
+        assert "[at:" not in out.text and "[" not in out.text, (
+            f"{form} 应被上游吞掉，实测 {out.text!r}"
+        )
+        assert out.text == "文本后缀"
+
+    async def test_unclosed_tag_survives_upstream(self):
+        """未闭合的 `[at:12`（无 `]`）不匹配 bracket 标记 → 上游保留。"""
+        MemeParser = _real_meme_parser()
+        out = MemeParser.parse("文本[at:12后缀", _MEME_CATS, **_MEME_LIVE_OPTS)
+        assert out.text == "文本[at:12后缀", f"实测 {out.text!r}"
+
+
+class TestUpstreamSwallowE2E:
+    """吞标签之后 AtTool 的两条链路（用真实解析器产出被吞文本）。"""
+
+    async def _chain_after_upstream(self, text: str, swallowed: bool):
+        """模拟 LLM 响应阶段：meme_manager 改写 completion_text 之后的最终文本。"""
+        MemeParser = _real_meme_parser()
+        opts = _MEME_LIVE_OPTS if swallowed else {"strip_references": True}
+        return MemeParser.parse(text, _MEME_CATS, **opts).text
+
+    async def test_a_swallowed_tag_is_invisible_to_attool_no_tool_call(self, tmp_path):
+        """(a) 标签已被吞且模型没调工具：AtTool 无从渲染 → 群里什么都没有。"""
+        LIVE = "2060958352"
+        visible = await self._chain_after_upstream(f"好的 [at:{LIVE}] 就这样", True)
+
+        plugin, event = new_plugin_and_event(chain=[Plain(visible)])
+        plugin._audit_dir = tmp_path
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.at_targets() == [], "标签已被上游吞掉，不可能有 At"
+        assert event.delivery.naked_tags() == [], "上游吞掉后更不会出现裸标签"
+        assert _audit_files(tmp_path) == [], "无渲染则无审计（与线上现象一致）"
+        assert event.delivery.text_of(-1) == "好的  就这样"
+
+    async def test_a2_swallowed_tag_rescued_by_tool_fallback(self, tmp_path):
+        """(a2) 标签被吞但模型调用过工具 → 兜底补插把艾特救回。"""
+        LIVE = "2060958352"
+        visible = await self._chain_after_upstream(f"好的 [at:{LIVE}] 就这样", True)
+
+        plugin, event = new_plugin_and_event(chain=[Plain(visible)], trusted_ids=set())
+        plugin._audit_dir = tmp_path
+        await run_llm_request(plugin, event)
+        mark_tool_confirmed(plugin, event, LIVE, fallback=True)  # search_and_mention 唯一命中
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.at_targets() == [LIVE], (
+            f"工具命中过的 ID 应由兜底补插救回，实测 {event.delivery.at_targets()}"
+        )
+        assert event.delivery.naked_tags() == []
+        assert _audit_files(tmp_path), "补插渲染应留下审计记录"
+
+    async def test_b_surviving_tag_renders_normally(self, tmp_path):
+        """(b) 标签在上游存活（如 remove_invalid=false）→ AtTool 正常渲染。"""
+        LIVE = "2060958352"
+        visible = await self._chain_after_upstream(f"好的 [at:{LIVE}] 就这样", False)
+        assert LIVE in visible
+
+        plugin, event = new_plugin_and_event(chain=[Plain(visible)], trusted_ids={LIVE})
+        plugin._audit_dir = tmp_path
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.at_targets() == [LIVE]
+        assert event.delivery.naked_tags() == []
+        assert _audit_files(tmp_path), "正常渲染应留下审计记录"
+
+
+# --------------------------------------------------------------------------- #
+# 11. T10：ID 可信来源约束（我自己的断言，不跑实现者用例）
+# --------------------------------------------------------------------------- #
+LIVE_FABRICATED_IDS = ("2060958352", "3882563785")
+
+
+class TestTrustedIdSourceVerifier:
+    async def test_fabricated_live_ids_hard_rejected(self, tmp_path, monkeypatch):
+        """线上两个编造 ID：既无工具确认、也不在用户消息里 → 硬拒绝。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("好的 [at:2060958352] 与 [at:3882563785] 都是他")],
+            trusted_ids=set(),
+        )
+        plugin._audit_dir = tmp_path
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.at_targets() == [], (
+            f"编造 ID 绝不能被渲染，实测 {event.delivery.at_targets()}"
+        )
+        text = event.delivery.text_of(-1)
+        assert "@2060958352" in text and "@3882563785" in text, f"应降级为纯文本：{text!r}"
+        assert event.delivery.naked_tags() == [], f"不得残留标签语法：{text!r}"
+        assert _audit_files(tmp_path) == [], "被拒绝的 ID 不得写审计"
+        untrusted_warns = [w for w in warnings if "未经工具确认" in w]
+        assert len(untrusted_warns) == 1, (
+            f"一轮渲染聚合一条告警，实测 {len(untrusted_warns)} 条：{untrusted_warns}"
+        )
+
+    async def test_tool_confirmed_id_renders_end_to_end(self):
+        """真调 search_and_mention 命中后，模型输出的 [at:ID] 必须渲染。"""
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        event.bot.member_list = [
+            {"user_id": "2060958352", "nickname": "柴郡", "card": "柴郡"},
+        ]
+        out = await plugin.search_and_mention(event, name="柴郡")
+        assert out.startswith("已找到"), f"工具应命中：{out!r}"
+
+        event.set_chain([Plain("就是他 [at:2060958352] 了")])
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.at_targets() == ["2060958352"], (
+            f"工具确认过的 ID 必须渲染，实测 {event.delivery.at_targets()}"
+        )
+        assert event.delivery.naked_tags() == []
+
+    async def test_user_message_qq_renders(self):
+        """用户在消息里给出 QQ 号 → 该 ID 可信（allow_direct_qq_at=true）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("好的 [at:2060958352]")],
+            trusted_ids=set(),
+            user_message="你艾特 2060958352 这个人",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["2060958352"]
+
+    async def test_inbound_chain_qq_renders(self):
+        """用户 QQ 号出现在入站消息链的 Plain 里（message_str 为空）→ 同样可信。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("好的 [at:2060958352]")],
+            trusted_ids=set(),
+            user_message="",
+            incoming=[Plain("帮我艾特 2060958352")],
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["2060958352"]
+
+    async def test_direct_qq_switch_off_requires_tool(self):
+        """allow_direct_qq_at=false：用户给了 QQ 也不算可信，必须走工具。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("好的 [at:2060958352]")],
+            trusted_ids=set(),
+            user_message="你艾特 2060958352 这个人",
+        )
+        plugin.allow_direct_qq_at = False
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        chain = event.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "开关关闭时不得凭用户消息渲染"
+        assert "@2060958352" in "".join(
+            c.text for c in chain if isinstance(c, Plain)
+        )
+
+    async def test_direct_qq_switch_off_tool_hit_still_renders(self):
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        plugin.allow_direct_qq_at = False
+        event.bot.member_list = [
+            {"user_id": "2060958352", "nickname": "柴郡", "card": "柴郡"},
+        ]
+        await plugin.search_and_mention(event, name="柴郡")
+
+        event.set_chain([Plain("[at:2060958352]")])
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["2060958352"]
+
+    async def test_fabricated_id_degrades_through_send_path(self):
+        """第三方清链逐段 send（绕过主钩子）时同样不得渲染编造 ID。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("前段\n\n后段 [at:2060958352]")],
+            trusted_ids=set(),
+        )
+        await run_llm_request(plugin, event)
+        await third_party_clear_and_send_each(plugin, event)
+        await run_main_hook(plugin, event)
+
+        assert event.delivery.at_targets() == [], (
+            f"send 路径也必须拒绝编造 ID，实测 {event.delivery.at_targets()}"
+        )
+        assert event.delivery.naked_tags() == []
+        assert "@2060958352" in "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+
+    async def test_fabricated_id_degrades_through_streaming(self):
+        """流式路径同样受 ID 可信来源约束。"""
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        await run_llm_request(plugin, event)
+        mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
+
+        async def gen():
+            yield mc_cls(chain=[Plain("最 [at:3882563785] 后")])
+
+        await event.send_streaming(gen(), False)
+        assert event.delivery.at_targets() == [], (
+            f"流式路径也必须拒绝编造 ID，实测 {event.delivery.at_targets()}"
+        )
+        assert event.delivery.naked_tags() == []
+
+
+# --------------------------------------------------------------------------- #
+# 12. 误判边界（实测并如实记录，内含 findings）
+# --------------------------------------------------------------------------- #
+class TestTrustedIdBoundaries:
+    async def test_non_qq_digits_in_user_message_are_trusted(self):
+        """【观察】用户消息里任意 5..12 位数字都会被当成可信 QQ（如金额/单号）。"""
+        results = {}
+        for num in ("19999", "1234567", "10086"):
+            plugin, event = new_plugin_and_event(
+                chain=[Plain(f"[at:{num}]")],
+                trusted_ids=set(),
+                user_message=f"我花了 {num} 元",
+            )
+            await run_llm_request(plugin, event)
+            await run_main_hook(plugin, event)
+            results[num] = [
+                str(c.qq) for c in event.get_result().chain if isinstance(c, At)
+            ]
+        assert results == {
+            "19999": ["19999"],
+            "1234567": ["1234567"],
+            "10086": ["10086"],
+        }, f"实测行为：{results}（非 QQ 数字会被当作可信来源）"
+
+    async def test_four_digit_year_is_not_a_source(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:2025]")],
+            trusted_ids=set(),
+            user_message="2025 年的时候",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert not any(isinstance(c, At) for c in event.get_result().chain), (
+            "4 位数字不匹配 5..12 位规则，不得成为可信来源"
+        )
+
+    async def test_previous_turn_qq_not_trusted_next_turn(self):
+        """【观察】上一轮给过 QQ、本轮只说"就他吧" → 无工具确认则不渲染（保守）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:2060958352]")],
+            trusted_ids=set(),
+            user_message="就他吧",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert not any(isinstance(c, At) for c in event.get_result().chain)
+        assert plugin._known_at_ids == {}, "用户消息来源不写会话记忆（只按本轮判定）"
+
+    async def test_tool_confirmation_persists_across_turns_within_ttl(self):
+        """工具确认过 → 下一轮（TTL 内、同 sender）只写标签也能渲染。"""
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        event.bot.member_list = [
+            {"user_id": "2060958352", "nickname": "柴郡", "card": "柴郡"},
+        ]
+        await plugin.search_and_mention(event, name="柴郡")
+
+        # 下一轮：用户只说"就他吧"，模型输出标签
+        event2 = FakeEvent(
+            chain=[Plain("[at:2060958352]")],
+            sender_id=event.get_sender_id(),
+            umo=event.unified_msg_origin,
+            group_id=event.get_group_id(),
+        )
+        await run_llm_request(plugin, event2)
+        await run_main_hook(plugin, event2)
+        assert [str(c.qq) for c in event2.get_result().chain if isinstance(c, At)] == [
+            "2060958352"
+        ]
+
+    @pytest.mark.xfail(
+        reason="T11 finding F2：跨组件拼合路径（_merge_split_at_tags）直接插入 At，"
+        "绕过 ID 可信来源判定 —— 待 repair 轮统一收口",
+        strict=False,
+    )
+    async def test_split_fabricated_id_with_middle_component_not_rendered(self):
+        """严格语义期望：被切碎且夹着其它组件的编造 ID 也不得渲染。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:20609"), At(qq="999"), Plain("58352]")],
+            trusted_ids=set(),
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        targets = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert "2060958352" not in targets, f"实测渲染了编造 ID：{targets}"
+
+    async def test_split_fabricated_id_observed_bypass(self, monkeypatch):
+        """T14/B2 起对齐到严格期望：切碎的编造 ID 也必须降级、不得拼成 At。
+
+        本用例原本记录 T11 时的"绕过行为实测"（`targets == ["2060958352", "999"]`）；
+        跨组件拼合纳入同一份可信集后，期望反转为：编造 ID 不渲染、原位降级为
+        `@2060958352`（数字文本保留、不静默删除），同时可信的 `At(999)` 保留。
+        """
+        warnings: list = []
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:20609"), At(qq="999"), Plain("58352]")],
+            trusted_ids=set(),
+        )
+        import astrbot_plugin_AtTool.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod.logger,
+            "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        targets = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert targets == ["999"], f"切碎的编造 ID 不得拼成 At（T14/B2），实测 {targets}"
+        text = "".join(
+            c.text for c in event.get_result().chain if isinstance(c, Plain)
+        ).replace("\u200b", "")
+        assert "@2060958352" in text, f"应原位降级为 @载荷、不得静默删除：{text!r}"
+        assert event.delivery.naked_tags() == [], "不得残留标签语法"
+        assert any("未经工具确认" in str(w) for w in warnings), (
+            f"降级必须留聚合告警，实测 {warnings}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 13. 状态治理：TTL / 容量 / 发送者绑定 / terminate
+# --------------------------------------------------------------------------- #
+class TestTrustedIdGovernance:
+    async def test_known_ids_expire_after_ttl(self):
+        plugin, event = new_plugin_and_event(chain=[Plain("[at:2060958352]")], trusted_ids=set())
+        mark_tool_confirmed(plugin, event, "2060958352")
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["2060958352"]
+
+        umo = event.unified_msg_origin
+        key = (umo, str(event.get_sender_id() or ""))
+        ids, ts = plugin._known_at_ids[key]
+        plugin._known_at_ids[key] = (ids, ts - 121)  # 超过 _KNOWN_AT_ID_TTL
+        event.set_chain([Plain("[at:2060958352]")])
+        await run_main_hook(plugin, event)
+        assert not any(isinstance(c, At) for c in event.get_result().chain), (
+            "TTL 过期后不得再凭会话记忆渲染"
+        )
+
+    async def test_known_ids_sender_bound_same_umo(self):
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        mark_tool_confirmed(plugin, event, "2060958352", fallback=False)
+
+        other = FakeEvent(
+            chain=[Plain("[at:2060958352]")],
+            sender_id="99999",
+            umo=event.unified_msg_origin,
+            group_id=event.get_group_id(),
+        )
+        await run_llm_request(plugin, other)
+        await run_main_hook(plugin, other)
+        assert not any(isinstance(c, At) for c in other.get_result().chain), (
+            "同会话换人后不得复用他人的工具确认结果（越权艾特）"
+        )
+        assert "2060958352" not in str(other.get_result().chain)
+
+    async def test_capacity_evicts_oldest_session(self):
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        # 501 个会话共用同一个 bot（成员列表一致），逐个真实调用工具登记 ID
+        shared_bot = FakeBot(
+            members=[{"user_id": "2060958352", "nickname": "柴郡", "card": "柴郡"}]
+        )
+        umos = []
+        for i in range(501):
+            ev = FakeEvent(
+                chain=[],
+                umo=f"aiocqhttp:GroupMessage:100{i}",
+                group_id="4242",
+                bot=shared_bot,
+                user_message="帮我艾特一下柴郡",
+            )
+            umos.append(ev.unified_msg_origin)
+            out = await plugin.search_and_mention(ev, name="柴郡")
+            assert out.startswith("已找到"), f"第 {i} 次工具调用应命中：{out!r}"
+
+        assert len(plugin._known_at_ids) == 500, (
+            f"超限应淘汰到容量上限 500，实测 {len(plugin._known_at_ids)}"
+        )
+        slot = (umos[0], "10001")
+        assert slot not in plugin._known_at_ids, "最早写入的会话槽位应被淘汰（FIFO）"
+        assert (umos[-1], "10001") in plugin._known_at_ids, "最新会话槽位必须保留"
+
+        evicted = FakeEvent(
+            chain=[Plain("[at:2060958352]")],
+            umo=umos[0],
+            group_id="4242",
+            sender_id="10001",
+        )
+        await run_llm_request(plugin, evicted)
+        await run_main_hook(plugin, evicted)
+        assert not any(isinstance(c, At) for c in evicted.get_result().chain), (
+            "被淘汰会话的确认结果不应复活"
+        )
+
+    async def test_terminate_clears_known_ids(self):
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        mark_tool_confirmed(plugin, event, "2060958352")
+        assert plugin._known_at_ids
+        await plugin.terminate()
+        assert plugin._known_at_ids == {}, "terminate 必须清空可信 ID 记忆"

@@ -28,6 +28,7 @@ __all__ = [
     "AT_TAG_LOOSE_PATTERN",
     "AT_TAG_PATTERN",
     "ROLE_LABELS",
+    "USER_QQ_PATTERN",
     "format_role_label",
     "match_session_entry",
     "check_session_lists",
@@ -71,6 +72,11 @@ _AT_TAG_PAYLOAD_SRC = r"([^\]]*)"
 # 载荷长度约束（r2 评审 F5）：QQ 号最长 12 位 ASCII 数字。更长的"纯数字"
 # 只可能是模型幻觉/粘贴物，渲染成 At 反而是"合法但不存在"的艾特目标。
 _AT_TAG_MAX_DIGITS: int = 12
+
+# T10：用户消息中"用户自己给出的 QQ 号"（直连来源）。5..12 位 ASCII 数字，
+# 且前后不得紧邻数字（避免从更长数字串里截取片段）；是否计入可信来源由
+# allow_direct_qq_at 开关决定（关掉后必须走 search_and_mention）。
+USER_QQ_PATTERN = re.compile(r"(?<![0-9])([0-9]{5,12})(?![0-9])")
 
 # 标签起始语法（含未闭合）：存在性判定的唯一入口，替代旧的裸 "[at:" 子串判定
 AT_TAG_HEAD_PATTERN = re.compile(_AT_TAG_HEAD_SRC)

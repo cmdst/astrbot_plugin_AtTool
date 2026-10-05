@@ -298,12 +298,19 @@ class FakeEvent(_make_aiocq_event_class()):
         umo=None,
         chain=None,
         bot=None,
+        incoming=None,
     ):
         self._group_id = group_id
         self._sender_id = sender_id
         self.unified_msg_origin = umo or f"aiocqhttp:GroupMessage:{group_id}"
         self.bot = bot if bot is not None else FakeBot()
         self._result = FakeResult(chain)
+        # 入站消息（用户发来的那条）与 message_str 同义来源；真机同样暴露
+        # AstrMessageEvent.get_messages()/message_str（T10 的 ID 来源判定依赖）
+        self._incoming = list(incoming) if incoming else []
+
+    def get_messages(self):
+        return list(self._incoming)
 
     def get_group_id(self):
         return self._group_id
@@ -358,6 +365,58 @@ class _FakeToolSet:
 
     def names(self):
         return list(self._names)
+
+
+def trust_chain_ids(plugin, event, chain=None):
+    """把链内成员标签载荷登记为"工具已确认"（T14 测试前提登记）。
+
+    形态/投递类用例考察的是标签形态与投递路径，因此把"ID 来源"这一维度固定
+    为可信：写入方式与 `search_and_mention`/`select_member_by_index` 的真实
+    写入同形（按 `(umo, sender_id)` 分槽）。ID 来源本身的判定另由
+    `tests/test_at_tag_compat.py::TestTrustedIdSource` 显式覆盖。
+
+    Args:
+        plugin: 真实插件实例。
+        event: 当前事件（提供 UMO 与 sender）。
+        chain: 待登记的消息链；None 时取 event.get_result().chain。
+    """
+    from astrbot.api.message_components import Plain
+
+    if chain is None:
+        chain = getattr(event.get_result(), "chain", None) or []
+    ids = set()
+    for comp in chain:
+        text = getattr(comp, "text", None)
+        if isinstance(comp, Plain) and text:
+            for match in main_mod.AT_TAG_LOOSE_PATTERN.finditer(text):
+                kind, value = main_mod.parse_at_tag_payload(match.group(1))
+                if kind == "at" and value != "all":
+                    ids.add(value)
+    trust_ids(plugin, event, *ids)
+
+
+def trust_ids(plugin, event, *ids):
+    """显式登记若干"工具已确认"的 ID（形态/投递类用例的前提登记）。
+
+    Args:
+        plugin: 真实插件实例。
+        event: 当前事件（提供 UMO 与 sender）。
+        *ids: 需要标为可信的成员 ID（字符串或整数）。
+    """
+    ids = {str(i) for i in ids}
+    if not ids:
+        return
+    key = (event.unified_msg_origin, str(event.get_sender_id() or ""))
+    cached = plugin._known_at_ids.get(key)
+    known = set(cached[0]) if cached else set()
+    known |= ids
+    plugin._known_at_ids[key] = (known, time.time())
+
+
+async def run_main_hook(plugin, event):
+    """主钩子封装：先登记链内 ID 为"工具已确认"，再跑 process_at_tags。"""
+    trust_chain_ids(plugin, event)
+    await plugin.process_at_tags(event)
 
 
 def make_request(tool_names=("search_and_mention", "select_member_by_index")):
@@ -525,7 +584,7 @@ class TestAuditLogIntegration:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("你好 [at:12345]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         from astrbot_plugin_AtTool.main import _AUDIT_OP_AT_MEMBER
 
@@ -546,7 +605,7 @@ class TestAuditLogIntegration:
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("[at:all]")])
         ev.bot.member_info_role = "owner"
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         log_path = audit_file(tmp_path, time.strftime("%Y%m%d"))
         rec = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
@@ -561,7 +620,7 @@ class TestAuditLogIntegration:
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("[at:all]")])
         ev.bot.member_info_role = "member"
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         log_path = audit_file(tmp_path, time.strftime("%Y%m%d"))
         rec = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
@@ -579,11 +638,11 @@ class TestAuditLogIntegration:
         ev.bot.member_info_role = "owner"
 
         # 第一次放行
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         # 第二次（冷却内）→ 拦截
         ev2 = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("[at:all]")])
         ev2.bot.member_info_role = "owner"
-        await plugin.process_at_tags(ev2)
+        await run_main_hook(plugin, ev2)
 
         log_path = audit_file(tmp_path, time.strftime("%Y%m%d"))
         recs = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -598,7 +657,7 @@ class TestAuditLogIntegration:
             config={"enable_audit_log": False}, audit_dir=tmp_path
         )
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("[at:12345]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert not audit_file(tmp_path, time.strftime("%Y%m%d")).exists()
 
 
@@ -613,7 +672,7 @@ class TestSessionAllowRenderIntegration:
             config={"session_blacklist": ["1000"]}, audit_dir=tmp_path
         )
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("你好 [at:12345] 再见")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         assert len(chain) == 1
         assert "[at:" not in chain[0].text
@@ -626,7 +685,7 @@ class TestSessionAllowRenderIntegration:
             config={"session_blacklist": ["1000"]}, audit_dir=tmp_path
         )
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("通知 [at:all] 请查看")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         assert any("@全体成员" in c.text for c in chain if hasattr(c, "text"))
 
@@ -637,7 +696,7 @@ class TestSessionAllowRenderIntegration:
             config={"session_whitelist": ["9999"]}, audit_dir=tmp_path
         )
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("[at:12345]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
 
@@ -653,7 +712,7 @@ class TestSessionAllowRenderIntegration:
             sender_id="10001",
             chain=[Plain("看[At:123]和[at：456]和[at:柴郡]")],
         )
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
@@ -899,15 +958,17 @@ class TestCacheLimit:
         plugin._member_cache["g"] = ([], time.time())
         plugin._at_all_last_trigger["g"] = time.time()
         plugin._pending_choices["umo"] = ([], time.time())
-        plugin._fallback_at["umo"] = ("10001", "1", time.time())
+        plugin._fallback_at[("umo", "10001")] = ("1", time.time())
         plugin._tool_absent_warned.add("umo")
         plugin._intent_unmet_warned.add("umo")
+        plugin._known_at_ids[("umo", "10001")] = ({"1"}, time.time())
         await plugin.terminate()
         assert not plugin._permission_cache
         assert not plugin._member_cache
         assert not plugin._at_all_last_trigger
         assert not plugin._pending_choices
         assert not plugin._fallback_at
+        assert not plugin._known_at_ids, "T10 可信 ID 记忆必须在卸载时清空"
         assert not plugin._tool_absent_warned
         assert not plugin._intent_unmet_warned, (
             "F8 新增的意图告警去重集合也必须在卸载时清空（与 _tool_absent_warned 同形）"
@@ -1174,7 +1235,7 @@ class TestZwspDedup:
         ev = FakeEvent(
             group_id="1000", sender_id="10001", chain=[Plain("[at:1][at:2]")]
         )
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
         plains = [c for c in chain if isinstance(c, Plain)]
@@ -1190,7 +1251,7 @@ class TestZwspDedup:
         ev = FakeEvent(
             group_id="1000", sender_id="10001", chain=[Plain("[at:1]你好[at:2]")]
         )
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
         assert len(ats) == 2
@@ -1207,7 +1268,7 @@ class TestZwspDedup:
         ev = FakeEvent(
             group_id="1000", sender_id="10001", chain=[Plain("[at:1][at:2]hi")]
         )
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
         plains = [c for c in chain if isinstance(c, Plain)]
@@ -1220,7 +1281,7 @@ class TestZwspDedup:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001", chain=[Plain("[at:1]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         assert [type(c).__name__ for c in chain] == ["At", "Plain"]
         assert chain[1].text == "\u200b"
@@ -1319,11 +1380,11 @@ class TestFallbackAtTag:
         ev = self._single_member_event()
         text = await plugin.search_and_mention(ev, "张三")
         assert "[at:1]" in text  # 工具正常返回标签提示
-        assert ev.unified_msg_origin in plugin._fallback_at  # 唯一命中已缓存
+        assert (ev.unified_msg_origin, "10001") in plugin._fallback_at  # 唯一命中已缓存
 
         # LLM 回复无任何标签 → 应兜底补插并渲染为 At 组件
         ev.set_chain([Plain("好的，这就把张三喊出来～")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "1"
@@ -1339,7 +1400,7 @@ class TestFallbackAtTag:
 
         # LLM 已输出标签 → 不补插、不重复艾特
         ev.set_chain([Plain("来了 [at:1]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "1"
@@ -1353,13 +1414,13 @@ class TestFallbackAtTag:
 
         # 第一轮回复已带标签 → 兜底缓存应被消费
         ev.set_chain([Plain("[at:1]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert ev.unified_msg_origin not in plugin._fallback_at
 
         # 第二轮（同一会话）无标签回复 → 不再兜底（缓存已消费，防跨轮次误用）
         ev2 = FakeEvent(group_id="1000", sender_id="10001")
         ev2.set_chain([Plain("没有标签的普通回复")])
-        await plugin.process_at_tags(ev2)
+        await run_main_hook(plugin, ev2)
         assert not any(isinstance(c, At) for c in ev2.get_result().chain)
 
     async def test_multi_match_no_fallback(self, tmp_path):
@@ -1377,7 +1438,7 @@ class TestFallbackAtTag:
         assert ev.unified_msg_origin not in plugin._fallback_at
 
         ev.set_chain([Plain("找到了多个，请选择序号")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert not any(isinstance(c, At) for c in ev.get_result().chain)
 
     async def test_multi_after_single_clears_cache(self, tmp_path):
@@ -1391,12 +1452,13 @@ class TestFallbackAtTag:
             {"user_id": "3", "nickname": "李四", "card": "", "role": "member"},
         ]
         await plugin.search_and_mention(ev, "张三")  # 唯一命中 → 写缓存
-        assert ev.unified_msg_origin in plugin._fallback_at
+        slot = (ev.unified_msg_origin, "10001")
+        assert slot in plugin._fallback_at
         await plugin.search_and_mention(ev, "张")  # 随后多结果 → 清缓存
-        assert ev.unified_msg_origin not in plugin._fallback_at
+        assert slot not in plugin._fallback_at
 
         ev.set_chain([Plain("请选择")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert not any(isinstance(c, At) for c in ev.get_result().chain)
 
     async def test_not_found_clears_cache(self, tmp_path):
@@ -1410,7 +1472,7 @@ class TestFallbackAtTag:
         assert ev.unified_msg_origin not in plugin._fallback_at
 
         ev.set_chain([Plain("没找到这个人")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert not any(isinstance(c, At) for c in ev.get_result().chain)
 
     async def test_no_search_no_fallback(self, tmp_path):
@@ -1419,7 +1481,7 @@ class TestFallbackAtTag:
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001")
         ev.set_chain([Plain("普通回复，无搜索")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert not any(isinstance(c, At) for c in ev.get_result().chain)
 
     async def test_expired_cache_no_fallback(self, tmp_path):
@@ -1429,15 +1491,12 @@ class TestFallbackAtTag:
         ev = self._single_member_event()
         await plugin.search_and_mention(ev, "张三")
         # 手工过期（TTL=120s）
-        val = plugin._fallback_at[ev.unified_msg_origin]
-        plugin._fallback_at[ev.unified_msg_origin] = (
-            val[0],
-            val[1],
-            time.time() - 121,
-        )
+        key = (ev.unified_msg_origin, "10001")
+        val = plugin._fallback_at[key]
+        plugin._fallback_at[key] = (val[0], time.time() - 121)
 
         ev.set_chain([Plain("过期后的回复")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         assert not any(isinstance(c, At) for c in ev.get_result().chain)
 
     async def test_fallback_not_injected_for_other_sender_same_umo(self, tmp_path):
@@ -1452,19 +1511,23 @@ class TestFallbackAtTag:
         plugin = make_plugin(audit_dir=tmp_path)
         ev_a = self._single_member_event()  # sender=10001
         await plugin.search_and_mention(ev_a, "张三")  # 唯一命中 → 写缓存
-        assert ev_a.unified_msg_origin in plugin._fallback_at
+        key_a = (ev_a.unified_msg_origin, "10001")
+        assert key_a in plugin._fallback_at
 
         ev_b = FakeEvent(group_id="1000", sender_id="20002")  # 同 UMO、不同 sender
         assert ev_b.unified_msg_origin == ev_a.unified_msg_origin
         ev_b.set_chain([Plain("今天天气不错～")])
-        await plugin.process_at_tags(ev_b)
+        await run_main_hook(plugin, ev_b)
 
         chain = ev_b.get_result().chain
         assert not any(isinstance(c, At) for c in chain), (
             "同群他人回复不得被补插 A 找到的成员"
         )
-        assert ev_b.unified_msg_origin not in plugin._fallback_at, (
-            "错配缓存必须一次性消费掉，避免后续轮次再误插"
+        assert (ev_b.unified_msg_origin, "20002") not in plugin._fallback_at, (
+            "乙不得持有甲的兜底缓存"
+        )
+        assert key_a in plugin._fallback_at, (
+            "按发起者分槽后，乙的渲染不得消费/清除甲的兜底缓存（T14/A3）"
         )
 
     async def test_fallback_injected_for_same_sender_same_umo(self, tmp_path):
@@ -1478,7 +1541,7 @@ class TestFallbackAtTag:
         # 同一 UMO + 同一 sender（宿主同事件后续渲染）
         ev_same = FakeEvent(group_id="1000", sender_id="10001")
         ev_same.set_chain([Plain("好的，这就把张三喊出来～")])
-        await plugin.process_at_tags(ev_same)
+        await run_main_hook(plugin, ev_same)
 
         ats = [c for c in ev_same.get_result().chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "1"
@@ -1491,13 +1554,12 @@ class TestFallbackAtTag:
         )
         ev = FakeEvent(group_id="1000", sender_id="10001")
         # 手工注入缓存（模拟搜索成功但会话随后被拉黑/不允许）
-        plugin._fallback_at[ev.unified_msg_origin] = (
-            "10001",
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = (
             "1",
             time.time(),
         )
         ev.set_chain([Plain("黑名单会话回复")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
         assert ev.unified_msg_origin not in plugin._fallback_at
@@ -1507,14 +1569,13 @@ class TestFallbackAtTag:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001")
-        plugin._fallback_at[ev.unified_msg_origin] = (
-            "10001",
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = (
             "1",
             time.time(),
         )
         # 其他来源已插入 At 组件 → 不再兜底追加，避免重复艾特
         ev.set_chain([At(qq="999"), Plain("已有艾特")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "999"
@@ -1527,7 +1588,7 @@ class TestFallbackAtTag:
         await plugin.search_and_mention(ev, "张三")
 
         ev.set_chain([Plain("兜底场景回复")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
         # 兜底补插的标签走正常渲染链路 → 审计日志应含 at_member 记录
         log_path = audit_file(tmp_path, time.strftime("%Y%m%d"))
         assert log_path.exists()
@@ -1667,7 +1728,7 @@ class TestToolCallObservability:
         await plugin.inject_at_instruction(ev, make_request())
 
         ev.set_chain([Plain("好的，@张三 你来说两句")])  # 纯文本假装艾特
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         assert any("未调用 search_and_mention" in str(w) for w in warnings), warnings
 
@@ -1687,7 +1748,7 @@ class TestToolCallObservability:
             ev = self._intent_event()  # 同一群 + 同一 sender → 同一 UMO
             await plugin.inject_at_instruction(ev, make_request())
             ev.set_chain([Plain("好的")])
-            await plugin.process_at_tags(ev)
+            await run_main_hook(plugin, ev)
 
         hits = [w for w in warnings if "未调用 search_and_mention" in str(w)]
         assert len(hits) == 1, f"每会话只应记一次，实际 {len(hits)} 次"
@@ -1697,7 +1758,7 @@ class TestToolCallObservability:
         ev2.message_str = "帮我艾特一下李四"
         await plugin.inject_at_instruction(ev2, make_request())
         ev2.set_chain([Plain("好的")])
-        await plugin.process_at_tags(ev2)
+        await run_main_hook(plugin, ev2)
         hits2 = [w for w in warnings if "未调用 search_and_mention" in str(w)]
         assert len(hits2) == 2
 
@@ -1719,7 +1780,7 @@ class TestToolCallObservability:
         await plugin.search_and_mention(ev, "张三")
 
         ev.set_chain([Plain("好的[at:1]")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         assert not any("未调用 search_and_mention" in str(w) for w in warnings)
 
@@ -1738,6 +1799,6 @@ class TestToolCallObservability:
         await plugin.inject_at_instruction(ev, make_request())
 
         ev.set_chain([Plain("是呀")])
-        await plugin.process_at_tags(ev)
+        await run_main_hook(plugin, ev)
 
         assert not any("未调用 search_and_mention" in str(w) for w in warnings)

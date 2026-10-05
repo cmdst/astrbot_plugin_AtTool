@@ -94,7 +94,7 @@ class TestDelayedRenderImmunity:
         # 恶意插件：清空链，重建时只保留 Plain 文本（含 [at:ID]）
         ev.set_chain([Plain("好的[at:10001]这就喊他！")])
         # AtTool 钩子最后执行（模拟 priority=-1000 排序）
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
@@ -118,7 +118,7 @@ class TestDelayedRenderImmunity:
 
         # 排序语义：priority=1（恶意）先执行，priority=-1000（AtTool）后执行
         await malicious_hook(ev)
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         ats = [c for c in ev.get_result().chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "10002"
@@ -127,7 +127,8 @@ class TestDelayedRenderImmunity:
         """链内跨组件残缺标签（[at:12 + 345] 分处相邻 Plain）合并后仍可渲染。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("开头[at:12"), Plain("345]结尾")])
-        await plugin.process_at_tags(ev)
+        ti.trust_ids(plugin, ev, "12345")
+        await ti.run_main_hook(plugin, ev)
 
         ats = [c for c in ev.get_result().chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "12345"
@@ -143,7 +144,7 @@ class TestDelayedRenderImmunity:
         plugin = make_plugin(audit_dir=tmp_path)
         first, second = Plain("你好"), Plain("世界")
         ev = FakeEvent(chain=[first, second])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         texts = [c.text for c in chain if isinstance(c, Plain)]
@@ -174,6 +175,7 @@ class TestSendFallbackRender:
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("第一段[at:10001]喊人")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg)
 
         assert len(ev.sent) == 1, "消息必须被发出"
@@ -189,6 +191,7 @@ class TestSendFallbackRender:
 
         seg1 = MessageChainStub([Plain("第一段[at:10001]喊人")])
         seg2 = MessageChainStub([Plain("第二段无标签")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg1)
         await ev.send(seg2)
 
@@ -229,6 +232,7 @@ class TestSendFallbackRender:
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("文本[at:10001]")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg)
 
         assert len(ev.sent) == 1
@@ -246,6 +250,7 @@ class TestSendFallbackRender:
         ev = SendableEvent(chain=[])
         plugin._wrap_event_send(ev)
         seg = MessageChainStub([Plain("文本[at:10001]")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg)
 
         assert len(ev.sent) == 1
@@ -262,6 +267,7 @@ class TestSendFallbackRender:
 
         assert getattr(ev, "_attool_send_wrapped", False) is True
         seg = MessageChainStub([Plain("文本[at:10001]")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg)
         assert any(isinstance(c, At) and str(c.qq) == "10001" for c in seg.chain)
 
@@ -277,6 +283,7 @@ class TestSendFallbackInvariants:
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("文本[at:10001]尾巴")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg)
 
         date_str = datetime.now().strftime("%Y%m%d")
@@ -292,7 +299,7 @@ class TestSendFallbackInvariants:
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("回复没带标签")])
@@ -300,7 +307,9 @@ class TestSendFallbackInvariants:
 
         assert not any(isinstance(c, At) for c in seg.chain), "send 路径不得补插"
         assert seg.chain[0].text == "回复没带标签"
-        assert ev.unified_msg_origin in plugin._fallback_at, "send 路径不得消费缓存"
+        assert (ev.unified_msg_origin, "10001") in plugin._fallback_at, (
+            "send 路径不得消费缓存"
+        )
 
     async def test_send_render_respects_blacklist(self, tmp_path):
         """会话准入降级在 send 兜底路径同样生效（[at:ID] 被剥离）。"""
@@ -351,6 +360,7 @@ class TestSendStreamingWrapper:
         async def gen():
             yield MessageChainStub([Plain("文本[at:10001]尾巴")])
 
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send_streaming(gen())
 
         sent = ev.sent
@@ -384,6 +394,7 @@ class TestSendStreamingWrapper:
         ev = SendableEvent(chain=[])
         plugin._wrap_event_send(ev)
 
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send("[at:10001]字符串消息")
 
         sent = ev.sent
@@ -406,7 +417,7 @@ class TestSendStreamingWrapper:
         """流式段无标签 + 兜底缓存存在 → 流式路径同样不补插（P0-2）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
         plugin._wrap_event_send(ev)
 
         async def gen():
@@ -420,7 +431,9 @@ class TestSendStreamingWrapper:
             "流式 send 路径不得补插"
         )
         assert sent[0].chain[0].text == "流式段无标签"
-        assert ev.unified_msg_origin in plugin._fallback_at, "不得消费兜底缓存"
+        assert (ev.unified_msg_origin, "10001") in plugin._fallback_at, (
+            "不得消费兜底缓存"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -441,11 +454,12 @@ class TestP1_1FallbackSemantics:
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
         plugin._wrap_event_send(ev)
 
         seg1 = MessageChainStub([Plain("第一段无标签")])
         seg2 = MessageChainStub([Plain("第二段[at:10001]喊人")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg1)
         await ev.send(seg2)
 
@@ -458,14 +472,16 @@ class TestP1_1FallbackSemantics:
             "[at:" in c.text for c in seg2.chain if isinstance(c, Plain)
         ), "段2标签不得被剥离为裸文本"
         # 缓存保留，交由主钩子消费
-        assert ev.unified_msg_origin in plugin._fallback_at, "缓存不得被 send 路径消费"
+        assert (ev.unified_msg_origin, "10001") in plugin._fallback_at, (
+            "缓存不得被 send 路径消费"
+        )
 
     async def test_main_hook_consumes_cache_when_has_tag(self, tmp_path):
         """回复已含标签：主钩子消费清理 send 路径保留的缓存（防跨轮次误用）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("回复带标签[at:10002]了")])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
-        await plugin.process_at_tags(ev)
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
+        await ti.run_main_hook(plugin, ev)
 
         ats = [c for c in ev.get_result().chain if isinstance(c, At)]
         assert len(ats) == 1 and str(ats[0].qq) == "10002"
@@ -484,8 +500,8 @@ class TestP1_1FallbackSemantics:
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
-        await plugin.process_at_tags(ev)
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
+        await ti.run_main_hook(plugin, ev)
 
         assert ev.unified_msg_origin not in plugin._fallback_at, (
             "主钩子链空时无法履行兜底义务，必须解除缓存，"
@@ -504,11 +520,14 @@ class TestP1_1FallbackSemantics:
             def get_result(self):
                 return None
 
-        ev = NoResultEvent()
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
-        await plugin.process_at_tags(ev)
+            def get_sender_id(self):
+                return "10001"
 
-        assert ev.unified_msg_origin not in plugin._fallback_at, (
+        ev = NoResultEvent()
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
+        await ti.run_main_hook(plugin, ev)
+
+        assert (ev.unified_msg_origin, "10001") not in plugin._fallback_at, (
             "result 为空时同样必须解除缓存，防止跨轮次误用"
         )
 
@@ -524,7 +543,7 @@ class TestP1_2LooseRecovery:
         """
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("开头[at:12\u200b345]结尾")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
@@ -542,6 +561,7 @@ class TestP1_2LooseRecovery:
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("分段[at:12\u200b345]喊人")])
+        ti.trust_ids(plugin, ev, "12345")
         await ev.send(seg)
 
         ats = [c for c in seg.chain if isinstance(c, At)]
@@ -552,7 +572,7 @@ class TestP1_2LooseRecovery:
         """P1-1：同一链内两处零宽污染标签必须全部恢复（不复现"只救一个"）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[at:11\u200b1] 和 [at:22\u200b2]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert [str(c.qq) for c in chain if isinstance(c, At)] == ["111", "222"]
@@ -563,7 +583,7 @@ class TestP1_2LooseRecovery:
         plugin = make_plugin(audit_dir=tmp_path)
         raw = "".join(f"[at:{i}\u200b00]尾巴" for i in range(1, 9))
         ev = FakeEvent(chain=[Plain(raw)])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         qqs = [str(c.qq) for c in chain if isinstance(c, At)]
@@ -587,7 +607,8 @@ class TestP1_2LooseRecovery:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("开头[at:12"), At(qq="999"), Plain("345]结尾")])
-        await plugin.process_at_tags(ev)
+        ti.trust_ids(plugin, ev, "12345")
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
@@ -617,7 +638,7 @@ class TestBrokenTagTolerance:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("文本[at:12345")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
@@ -656,7 +677,7 @@ class TestSendPathContraction:
         """兜底缓存存在但本段无标签：send 路径不得补插（补插只由主钩子承担）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("第一段文字")])
@@ -673,6 +694,7 @@ class TestSendPathContraction:
 
         seg1 = MessageChainStub([Plain("第一段[at:10001]喊人")])
         seg2 = MessageChainStub([Plain("第二段[at:10002]再喊一个")])
+        ti.trust_ids(plugin, ev, "10001", "10002")
         await ev.send(seg1)
         await ev.send(seg2)
 
@@ -688,15 +710,16 @@ class TestSendPathContraction:
         """send 路径不得消费兜底缓存（缓存必须留给主钩子）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[])
-        plugin._fallback_at[ev.unified_msg_origin] = ("10001", "10001", time.time())
+        plugin._fallback_at[(ev.unified_msg_origin, "10001")] = ("10001", time.time())
+        ti.trust_ids(plugin, ev, "10001")
         plugin._wrap_event_send(ev)
 
         await ev.send(MessageChainStub([Plain("无标签段")]))
-        assert ev.unified_msg_origin in plugin._fallback_at
+        assert (ev.unified_msg_origin, "10001") in plugin._fallback_at
 
         # 主钩子随后仍能履行补插义务
         ev.set_chain([Plain("整链最后渲染")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
         assert [str(c.qq) for c in ev.get_result().chain if isinstance(c, At)] == ["10001"]
 
     async def test_send_path_still_renders_existing_tag(self, tmp_path):
@@ -706,6 +729,7 @@ class TestSendPathContraction:
         plugin._wrap_event_send(ev)
 
         seg = MessageChainStub([Plain("文本[At:10001]尾巴")])
+        ti.trust_ids(plugin, ev, "10001")
         await ev.send(seg)
 
         assert [str(c.qq) for c in seg.chain if isinstance(c, At)] == ["10001"]
@@ -722,7 +746,7 @@ class TestTagFormInvariant:
         ev = FakeEvent(
             chain=[Plain("[At:1] [AT:2] [at: 3] [at：4] [at : 5] [at\u200b:6]")]
         )
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert [str(c.qq) for c in chain if isinstance(c, At)] == [
@@ -748,7 +772,7 @@ class TestTagFormInvariant:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[at:柴郡]和[at:ID]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
@@ -759,7 +783,7 @@ class TestTagFormInvariant:
         """全角数字不得产生 At 组件（Python \\d 陷阱回归）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[at:１２３]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
@@ -769,7 +793,7 @@ class TestTagFormInvariant:
         """未闭合标签：删除起始语法、保留正文（spec §7.2 第 15 行）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("前面[at:123")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
@@ -782,11 +806,12 @@ class TestTagFormInvariant:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain(text)])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         plugin2 = make_plugin(audit_dir=tmp_path)
         ev2 = SendableEvent(chain=[])
         plugin2._wrap_event_send(ev2)
+        ti.trust_ids(plugin2, ev2, "1", "2")
         await ev2.send(MessageChainStub([Plain(text)]))
 
         def summarize(chain):
@@ -853,7 +878,8 @@ class TestSplitterInterop:
         # 场景 1+5：模型写 [at:123] → 恰好一次 At(123)，全程无裸标签
         plugin = make_plugin(audit_dir=tmp_path)
         ev = SendableEvent(chain=[Plain("第一段无标签\n第二段[at:123]喊人\n第三段")])
-        await plugin.process_at_tags(ev)
+        ti.trust_ids(plugin, ev, "123")
+        await ti.run_main_hook(plugin, ev)
         delivered = await _deliver_segments(plugin, ev, ev.get_result().chain)
         assert sum(
             1 for seg in delivered for c in seg if isinstance(c, At) and str(c.qq) == "123"
@@ -868,6 +894,7 @@ class TestSplitterInterop:
         # 场景 3：模型写大写 [At:123] → 同样恰好一次 At(123) 且无 "[At:" 明文
         plugin2 = make_plugin(audit_dir=tmp_path)
         ev2 = SendableEvent(chain=[Plain("甲段\n乙段[At:123]喊人\n丙段")])
+        ti.trust_ids(plugin2, ev2, "123")
         await plugin2.process_at_tags(ev2)
         delivered2 = await _deliver_segments(plugin2, ev2, ev2.get_result().chain)
         assert [str(c.qq) for seg in delivered2 for c in seg if isinstance(c, At)] == ["123"]
@@ -878,7 +905,8 @@ class TestSplitterInterop:
         # 场景 2：模型漏写标签 + 唯一命中缓存 → 恰好一次 At，位置在最后一段
         plugin3 = make_plugin(audit_dir=tmp_path)
         ev3 = SendableEvent(chain=[Plain("一段没有标签\n二段也没有\n三段")])
-        plugin3._fallback_at[ev3.unified_msg_origin] = ("10001", "10001", time.time())
+        plugin3._fallback_at[(ev3.unified_msg_origin, "10001")] = ("10001", time.time())
+        ti.trust_ids(plugin3, ev3, "10001")
         await plugin3.process_at_tags(ev3)
         delivered3 = await _deliver_segments(plugin3, ev3, ev3.get_result().chain)
         assert sum(1 for seg in delivered3 for c in seg if isinstance(c, At)) == 1
@@ -890,7 +918,8 @@ class TestSplitterInterop:
         # 场景 4：模型写 [at:999] 而缓存是 123（不同人）→ 只出现 At(999)
         plugin4 = make_plugin(audit_dir=tmp_path)
         ev4 = SendableEvent(chain=[Plain("一段[at:999]喊人\n二段收尾")])
-        plugin4._fallback_at[ev4.unified_msg_origin] = ("10001", "123", time.time())
+        plugin4._fallback_at[(ev4.unified_msg_origin, "10001")] = ("123", time.time())
+        ti.trust_ids(plugin4, ev4, "999")
         await plugin4.process_at_tags(ev4)
         delivered4 = await _deliver_segments(plugin4, ev4, ev4.get_result().chain)
         assert [str(c.qq) for seg in delivered4 for c in seg if isinstance(c, At)] == ["999"]
@@ -905,7 +934,7 @@ class TestChainMutationIsolation:
         plugin = make_plugin(audit_dir=tmp_path)
         originals = [Plain("前置 \u200b[at:10001]"), Plain(" 后置\u200b")]
         ev = FakeEvent(chain=list(originals))
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         assert originals[0].text == "前置 \u200b[at:10001]"
         assert originals[1].text == " 后置\u200b"
@@ -920,12 +949,12 @@ class TestAuditDedup:
         """同一事件内同目标重复渲染只审计一次（第三方插件重建链场景）。"""
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("喊人[at:10001]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
         assert [str(c.qq) for c in ev.get_result().chain if isinstance(c, At)] == ["10001"]
 
         # 第三方插件用原文本重建链 → 主钩子（或 send）再渲染一次同一目标
         ev.set_chain([Plain("喊人[at:10001]")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         records = [
             json.loads(line)
@@ -941,10 +970,10 @@ class TestAuditDedup:
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain("[at:all]集合")])
         ev.bot.member_info_role = "owner"
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         ev.set_chain([Plain("[at:all]集合")])
-        await plugin.process_at_tags(ev)
+        await ti.run_main_hook(plugin, ev)
 
         records = [
             json.loads(line)
