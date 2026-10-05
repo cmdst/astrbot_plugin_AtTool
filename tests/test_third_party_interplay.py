@@ -2839,3 +2839,201 @@ class TestMembershipSourceVariants:
         assert targets == [victim_ok], f"引用来源也要过成员名单，实测 {targets}"
         # 非成员号降级；它不在名单里，因此没有昵称可用 → 回退 @数字
         assert f"@{victim_bad}" in _plain_text(chain), "非成员号应降级为 @数字"
+
+
+# =========================================================================== #
+# T29 追加：意图化触发规则（T28）的文本口径验证
+#   提示词改动没有可执行行为断言，故以"规则文本 + 语句判定表"为主要证据：
+#   每条判定都必须能在注入文本里找到**决定该判定的原句**（缺句即失败）。
+# =========================================================================== #
+
+T29_SECTION_HEAD = "### 什么时候必须调用 search_and_mention（看意图，不是看关键词）"
+
+# 语句判定表：语句 → 期望动作 → 依据（注入文本里必须存在的原句片段）
+# 期望动作取值："must_call"（必须调工具）/ "no_call"（不调、不输出标签）/
+#              "qq_branch"（交给「QQ号处理」小节决定）
+T29_UTTERANCES = [
+    ("1-直连号", "帮我艾特一下群友：436797884", "qq_branch",
+     "用户直接给出 QQ 号时按「QQ号处理」小节处理"),
+    ("2-线上事故句", "艾特一下，我试试看呢。", "must_call",
+     "只要意图是让你把某位群成员「叫出来 / 提醒他 / 让他注意 / 让他回应」"),
+    ("3-模糊名字", "帮我艾特一下陨落星辰。", "must_call",
+     "无论用什么说法，都必须先调用"),
+    ("4-口语补充说明", "我的意思是你帮我艾特一下群友，海阔天空。", "must_call",
+     "无论用什么说法，都必须先调用"),
+    ("5-反例-仅提及", "刚才张三说的那件事", "no_call",
+     "只是顺带提到某人的名字、并不要求他回应：不要调用工具"),
+    ("6-口语化请求", "把海阔天空叫出来，让他看看这个", "must_call",
+     "「把张三叫出来」"),
+    ("7-提醒语义", "提醒一下陨落星辰交作业", "must_call",
+     "「提醒一下王五」"),
+    ("8-@群主", "@群主 这个怎么弄", "must_call",
+     "「@群主」"),
+    ("9-自目标", "你@我一下", "must_call",
+     "艾特当前说话人也必须先调用工具"),
+    ("10-负面指令", "别艾特任何人，只是问问", "no_call",
+     "只是顺带提到某人的名字、并不要求他回应：不要调用工具"),
+]
+
+TRIGGER_WORDS = ["艾特", "@", "at", "叫一下", "喊一下", "呼叫", "叫他/她", "找一下"]
+
+
+class TestIntentTriggerRulesText:
+    @staticmethod
+    def _injected(allow_direct: bool = True, tool_names=("search_and_mention",)):
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        plugin.allow_direct_qq_at = allow_direct
+        req = make_request(tool_names)
+        return plugin, event, req
+
+    async def _system_prompt(self, allow_direct: bool = True,
+                             tool_names=("search_and_mention",)) -> str:
+        plugin, event, req = self._injected(allow_direct, tool_names)
+        await plugin.inject_at_instruction(event, req)
+        return req.system_prompt
+
+    async def test_injected_text_contains_intent_and_counter_rules(self):
+        prompt = await self._system_prompt()
+        assert T29_SECTION_HEAD in prompt, "缺少意图判定小节标题"
+        assert "判断依据是**用户的意图**，不是他用了哪个词" in prompt
+        assert "都必须先调用" in prompt, "缺少'必须调用'的意图规则"
+        assert "只是顺带提到某人的名字、并不要求他回应：不要调用工具" in prompt, (
+            "缺少反向规则（仅提及不要求回应 ⇒ 不调工具）"
+        )
+        assert "也不要输出任何 [at:ID] 标签" in prompt, "反向规则须含'不输出标签'"
+
+    async def test_legacy_trigger_words_kept_as_examples(self):
+        prompt = await self._system_prompt()
+        for word in TRIGGER_WORDS:
+            assert word in prompt, f"既有触发词丢失：{word!r}"
+        assert "只是例子，不是触发条件清单" in prompt, (
+            "触发词必须降级为'例子'而非'条件清单'"
+        )
+        assert "没有出现这些词也可能需要" in prompt
+
+    async def test_section_order_and_qq_defer_clause(self):
+        prompt = await self._system_prompt()
+        i_qq = prompt.index("### QQ号处理")
+        i_intent = prompt.index(T29_SECTION_HEAD)
+        i_multi = prompt.index("### 多个成员的艾特选择")
+        i_self = prompt.index("### 艾特当前说话人也必须先调用工具")
+        assert i_qq < i_intent < i_multi < i_self, "小节顺序被改动"
+        section = prompt[i_intent:i_multi]
+        assert "「QQ号处理」小节" in section and "不改变该分支的约束" in section, (
+            "意图小节必须显式让位于「QQ号处理」分支"
+        )
+
+    async def test_reaches_system_prompt_when_tool_present(self):
+        prompt = await self._system_prompt()
+        assert T29_SECTION_HEAD in prompt
+
+    async def test_not_injected_when_tool_absent(self):
+        prompt = await self._system_prompt(tool_names=())
+        assert T29_SECTION_HEAD not in prompt, "工具缺席时不应注入意图小节"
+        assert "未启用艾特工具" in prompt
+
+    async def test_direct_qq_branches_self_consistent(self):
+        on = await self._system_prompt(allow_direct=True)
+        off = await self._system_prompt(allow_direct=False)
+        assert "不需要再调用 search_and_mention 工具搜索" in on
+        assert "你也必须调用 search_and_mention 工具" in off
+        for prompt in (on, off):
+            assert "不改变该分支的约束" in prompt, "两个分支都必须保留让位声明"
+
+    @pytest.mark.parametrize(
+        "case_id,utterance,expected,clause",
+        T29_UTTERANCES,
+        ids=[u[0] for u in T29_UTTERANCES],
+    )
+    async def test_utterance_decision_clause_present(
+        self, case_id, utterance, expected, clause
+    ):
+        """每条判定的**决定句**都必须真实存在于注入文本（缺句 = 判定无依据）。"""
+        prompt = await self._system_prompt()
+        assert clause in prompt, (
+            f"[{case_id}] {utterance!r} → {expected}：依据原句缺失 {clause!r}"
+        )
+
+    async def test_at_all_intent_gap_observed(self):
+        """【T32 起翻转】F1 缺口已闭：意图小节已排除「@全体 / 大家 / 所有人」。
+
+        原用例钉住"节内无全体/所有人字样（缺口 F1）"；T32 按队长裁定在意图节
+        补了「要 @ 全体 / 大家 / 所有人时，按【@全体权限】那一节处理；不要拿
+        这些词去调 search_and_mention」，因此这里改为断言覆盖。
+        """
+        prompt = await self._system_prompt()
+        section = prompt[prompt.index(T29_SECTION_HEAD):prompt.index("### 多个成员的艾特选择")]
+        assert "全体" in section and "所有人" in section, (
+            f"意图小节应已排除 @全体/大家，实测 {section!r}"
+        )
+        assert "按【@全体权限】那一节处理" in section, (
+            "应显式把 @全体 路由到【@全体权限】小节"
+        )
+        assert "不要拿这些词去调 search_and_mention" in section
+        # @全体 自身有独立分支文本，但走的是**另一条注入通道**
+        # （extra_user_content_parts 而非 system_prompt，main.py 内
+        #  `req.extra_user_content_parts.append(TextPart(...).mark_as_temp())`）
+        plugin, event, req = self._injected()
+        await plugin.inject_at_instruction(event, req)
+        extra = "".join(
+            getattr(p_, "text", "") for p_ in req.extra_user_content_parts
+        )
+        assert "@全体权限" in extra, "缺少 @全体 权限说明（extra_user_content_parts）"
+        # T32：意图节新增了「按【@全体权限】那一节处理」的**交叉引用**，因此不能再
+        # 用裸 token "@全体权限" 判定通道；这里改为断言"权限判定结论"仍只走 extra。
+        assert (
+            "当前操作者具备@全体权限" in extra
+            or "当前操作者不具备@全体权限" in extra
+        ), "缺少 @全体 权限判定结论（extra_user_content_parts）"
+        assert "当前操作者具备@全体权限" not in req.system_prompt
+        assert "当前操作者不具备@全体权限" not in req.system_prompt, (
+            "权限判定结论不得改走 system_prompt（运行时注入通道口径变化，请更新本用例与报告 §4）"
+        )
+
+    async def test_no_target_utterance_gap_observed(self):
+        """【T32 起翻转】F2 缺口已闭：只说「艾特一下」而没给对象时先追问。
+
+        原用例按「没说是谁 / 先追问」两个措辞钉住缺口；T32 补入的句子是
+        「先说一句话反问他指的是谁，不要猜、也不要调用工具」，因此改为断言
+        该指引确实在注入文本里。
+        """
+        prompt = await self._system_prompt()
+        assert "先用一句话反问他指的是谁" in prompt, (
+            "缺「未给出对象时先追问」的指引"
+        )
+        assert "不要猜、也不要调用工具" in prompt
+        # 不允许出现"猜一个对象去搜"之类反向指引
+        assert "猜一个" not in prompt
+
+    async def test_negative_instruction_and_pure_query_rules_present(self):
+        """T32 新增两句：否定指令（O1）与纯查询（L1）都必须显式禁止输出标签。"""
+        prompt = await self._system_prompt()
+        assert "别艾特任何人" in prompt, "O1：否定指令反例缺失"
+        assert "不要 @ 他" in prompt
+        assert "绝对不要调用工具、也不要输出标签" in prompt
+
+        assert "只是想**查询**某人的 QQ 号 / 群名片" in prompt, "L1：纯查询指引缺失"
+        assert "不要在正文里输出 [at:ID] 标签" in prompt, (
+            "L1：纯查询场景必须显式禁止输出 [at:ID]"
+        )
+
+    async def test_user_llm_prompt_keyword_framing_is_overridden_after_it(self):
+        """用户已保存的 llm_prompt 若仍是"关键词清单"口径，T28 小节必须在其**之后**
+        出现并显式否定该口径（static + dynamic 的真实拼接顺序）。"""
+        user_prompt = (
+            "## 艾特操作\n"
+            "当用户要求你艾特/呼叫某个群成员时（包括「艾特」「@」「at」「叫一下」"
+            "「喊一下」「呼叫」「叫他/叫她」等任何说法），必须调用 "
+            "`search_and_mention` 工具获取 [at:ID] 标签。"
+        )
+        plugin, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        plugin.llm_prompt_base = user_prompt
+        req = make_request(("search_and_mention",))
+        await plugin.inject_at_instruction(event, req)
+
+        prompt = req.system_prompt
+        assert user_prompt in prompt, "用户静态提示词必须原样保留"
+        i_static = prompt.index(user_prompt)
+        i_intent = prompt.index(T29_SECTION_HEAD)
+        assert i_static < i_intent, "T28 小节必须在用户静态提示词之后（recency）"
+        assert "不是他用了哪个词" in prompt[i_intent:], "必须有否定关键词口径的原句"

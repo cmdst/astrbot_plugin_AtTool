@@ -870,6 +870,89 @@ class TestSelfTargetAndNicknameDegrade:
         assert f"@{self.SELF_QQ}" in "".join(_plain_texts(chain))
 
 
+class TestIntentBasedTriggerRules:
+    """T28：把「必须调用艾特工具」的触发条件从关键词枚举改为意图判定。
+
+    线上实测（00:03:36）：用户说「艾特一下，我试试看呢。」，模型直接写标签、未调
+    工具——根因是模型把注入文本里的触发词读成了"触发条件清单"。改法：以用户意图
+    为准（叫出来/提醒/让他注意/让他回应），触发词降级为例句，并写明"只是顺带提到
+    名字就不要调用"的反例（防高频误 @）。
+    """
+
+    TRIGGER_LIST = "艾特、@、at、叫一下、喊一下、呼叫、叫他/她"
+    POSITIVE = ("把张三叫出来", "让李四看看这个", "提醒一下王五")
+    NEGATIVE = ("刚才张三说的那件事", "李四昨天做的事", "我记得王五提过这个")
+
+    async def test_intent_rule_and_examples_present(self, tmp_path):
+        """规则要点 + 保留的触发词 + 正/反例 + 防误 @ 反向规则齐备。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        text = plugin._build_dynamic_instructions()
+
+        # ① 意图判定（而非关键词）
+        for kw in (
+            "看意图，不是看关键词",
+            "用户的意图",
+            "叫出来",
+            "提醒他",
+            "让他注意",
+            "让他回应",
+            "无论用什么说法",
+            "不是触发条件清单",
+        ):
+            assert kw in text, f"缺意图规则要点：{kw!r}"
+        # ② 既有触发词不得丢失（降级为例句）
+        assert self.TRIGGER_LIST in text, "触发词清单不得丢失"
+        # ③ 正例
+        for example in self.POSITIVE:
+            assert example in text, f"缺正例：{example!r}"
+        # ④ 反例 + 不调用/不输出标签
+        for example in self.NEGATIVE:
+            assert example in text, f"缺反例：{example!r}"
+        assert "并不要求他回应" in text and "不要调用工具" in text
+        assert "不要输出任何 [at:ID] 标签" in text
+        # ⑤ 不得放宽直连号分支
+        assert "按「QQ号处理」小节处理" in text
+        # ⑥ T32 新增四句：F1 @全体 / F2 无对象先追问 / O1 否定指令 / L1 纯查询
+        assert "按【@全体权限】那一节处理" in text
+        assert "先用一句话反问他指的是谁" in text
+        assert "别艾特任何人" in text and "不要 @ 他" in text
+        assert "只是想**查询**某人的 QQ 号 / 群名片" in text
+        assert "不要在正文里输出 [at:ID] 标签" in text
+
+    async def test_intent_rule_reaches_system_prompt_with_tool(self, tmp_path):
+        """工具可达时，该规则经 inject_at_instruction 落入 system_prompt。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1035699087", sender_id="10001")
+        req = ti.make_request()
+        await plugin.inject_at_instruction(ev, req)
+
+        assert "看意图，不是看关键词" in req.system_prompt
+        assert self.POSITIVE[0] in req.system_prompt
+        assert self.NEGATIVE[0] in req.system_prompt
+
+    async def test_intent_rule_absent_when_tool_unavailable(self, tmp_path):
+        """工具缺席时不得注入该规则（不得要求调用不存在的工具）。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1035699087", sender_id="10001")
+        req = ti.make_request(tool_names=())
+        await plugin.inject_at_instruction(ev, req)
+
+        assert "看意图，不是看关键词" not in req.system_prompt
+        assert "search_and_mention" not in req.system_prompt
+
+    async def test_direct_qq_branch_still_gated_by_switch(self, tmp_path):
+        """用户给出 QQ 号的分支仍受 allow_direct_qq_at 约束（不得放宽）。"""
+        on = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        text_on = on._build_dynamic_instructions()
+        assert "用户可能会直接提供QQ号" in text_on
+        assert "不需要再调用 search_and_mention 工具搜索" in text_on
+
+        off = make_plugin(config={"allow_direct_qq_at": False}, audit_dir=tmp_path)
+        text_off = off._build_dynamic_instructions()
+        assert "即使用户直接提供了QQ号，你也必须调用 search_and_mention 工具" in text_off
+        assert "确认该成员存在后才可以使用 [at:ID] 标签" in text_off
+
+
 class TestStreamingFormRows:
     """流式路径形态（spec §7.2 第 17/18 行）。"""
 
