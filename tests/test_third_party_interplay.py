@@ -1512,23 +1512,33 @@ class TestTrustedIdSourceVerifier:
         assert event.delivery.naked_tags() == []
 
     async def test_user_message_qq_renders(self):
-        """用户在消息里给出 QQ 号 → 该 ID 可信（allow_direct_qq_at=true）。"""
+        """用户在消息里给出**本群成员**号 → 该 ID 可信（allow_direct_qq_at=true）。
+
+        T24 起直连号还要过本群成员名单，因此这里把该号放进成员列表：本用例仍然
+        刻画"消息内给出的号是可信来源"这一面（名单不可用时一律降级，见
+        TestDirectIdMembershipVerification）。
+        """
         plugin, event = new_plugin_and_event(
             chain=[Plain("好的 [at:2060958352]")],
             trusted_ids=set(),
             user_message="你艾特 2060958352 这个人",
+            bot=FakeBot(members=[{"user_id": "2060958352", "nickname": "柴郡"}]),
         )
         await run_llm_request(plugin, event)
         await run_main_hook(plugin, event)
         assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["2060958352"]
 
     async def test_inbound_chain_qq_renders(self):
-        """用户 QQ 号出现在入站消息链的 Plain 里（message_str 为空）→ 同样可信。"""
+        """用户 QQ 号出现在入站消息链的 Plain 里（message_str 为空）→ 同样可信。
+
+        T24 起同样要求该号是本群成员（这里放进成员列表）。
+        """
         plugin, event = new_plugin_and_event(
             chain=[Plain("好的 [at:2060958352]")],
             trusted_ids=set(),
             user_message="",
             incoming=[Plain("帮我艾特 2060958352")],
+            bot=FakeBot(members=[{"user_id": "2060958352", "nickname": "柴郡"}]),
         )
         await run_llm_request(plugin, event)
         await run_main_hook(plugin, event)
@@ -1603,13 +1613,19 @@ class TestTrustedIdSourceVerifier:
 # --------------------------------------------------------------------------- #
 class TestTrustedIdBoundaries:
     async def test_non_qq_digits_in_user_message_are_trusted(self):
-        """【观察】用户消息里任意 5..12 位数字都会被当成可信 QQ（如金额/单号）。"""
+        """【观察】用户消息里任意 5..12 位数字，**只要是本群成员**就被当成可信 QQ。
+
+        T16 起直连号还要过本群成员名单；本用例把三个号码都放进成员列表，因此它
+        仍然刻画 F3 的"消息内数字即来源"这一面（非成员号会被降级，见
+        tests/test_at_tag_compat.py::TestDirectQqGroupMembership）。
+        """
         results = {}
         for num in ("19999", "1234567", "10086"):
             plugin, event = new_plugin_and_event(
                 chain=[Plain(f"[at:{num}]")],
                 trusted_ids=set(),
                 user_message=f"我花了 {num} 元",
+                bot=FakeBot(members=[{"user_id": num, "nickname": f"成员{num}"}]),
             )
             await run_llm_request(plugin, event)
             await run_main_hook(plugin, event)
@@ -1667,11 +1683,8 @@ class TestTrustedIdBoundaries:
             "2060958352"
         ]
 
-    @pytest.mark.xfail(
-        reason="T11 finding F2：跨组件拼合路径（_merge_split_at_tags）直接插入 At，"
-        "绕过 ID 可信来源判定 —— 待 repair 轮统一收口",
-        strict=False,
-    )
+    # T11 finding F2 已在 T14/B2 修复：跨组件拼合与逐组件解析共用同一份可信集，
+    # 原先的 xfail(strict=False) 已转为正式断言（本条此前长期 XPASS）。
     async def test_split_fabricated_id_with_middle_component_not_rendered(self):
         """严格语义期望：被切碎且夹着其它组件的编造 ID 也不得渲染。"""
         plugin, event = new_plugin_and_event(
@@ -1800,3 +1813,491 @@ class TestTrustedIdGovernance:
         assert plugin._known_at_ids
         await plugin.terminate()
         assert plugin._known_at_ids == {}, "terminate 必须清空可信 ID 记忆"
+
+
+# =========================================================================== #
+# T17 追加：直连号码成员校验 + 平台拒绝非法 At 的链路复现（我自建断言）
+# =========================================================================== #
+
+# 线上实测：用户在消息里给出该号 → 插件渲染 At → NapCat/OneBot 拒绝整条消息
+LIVE_BOGUS_QQ = "1645896432"
+# 本群真实成员号（同一群成员列表里）
+MEMBER_QQ = "2060958352"
+
+
+class PlatformActionFailed(Exception):
+    """桩平台的 ActionFailed：等效线上 `ActionFailed retcode=1200 'Get Uid Error'`。
+
+    线上现象（队长取证）：平台无法解析 `At` 目标 QQ 时**拒绝整条消息**
+    （respond.stage 报错），正文一起丢掉，群里只剩另一条表情包消息。
+    """
+
+    def __init__(self, retcode: int = 1200, message: str = "Get Uid Error"):
+        super().__init__(f"ActionFailed retcode={retcode} {message}")
+        self.retcode = retcode
+        self.message = message
+
+
+class ValidatingPlatformEvent(FakeEvent):
+    """桩事件：send 时按平台语义校验 At 目标。
+
+    `platform_valid_qqs` 表示平台能解析的 QQ 集合（等效"平台侧存在的账号"）；
+    链里出现任何不在该集合内的 At（`all` 除外）→ 抛 `PlatformActionFailed`，
+    整条消息不投递，与线上一致。
+
+    Args:
+        platform_valid_qqs: 平台可解析的 QQ（通常 = 本群真实成员 ∪ 平台账号）。
+    """
+
+    def __init__(self, *, platform_valid_qqs=(), **kwargs):
+        super().__init__(**kwargs)
+        self.platform_valid_qqs = {str(q) for q in platform_valid_qqs}
+        self.rejections: list = []
+
+    def _bad_targets(self, message) -> list:
+        chain = getattr(message, "chain", None)
+        if not isinstance(chain, list):
+            return []
+        out = []
+        for comp in chain:
+            if isinstance(comp, At):
+                qq = str(comp.qq)
+                if qq != "all" and qq not in self.platform_valid_qqs:
+                    out.append(qq)
+        return out
+
+    async def send(self, message):
+        bad = self._bad_targets(message)
+        if bad:
+            self.rejections.append(bad)
+            raise PlatformActionFailed()
+        self.delivery.record("event.send", message)
+
+    async def send_streaming(self, generator, use_fallback=False):
+        async for item in generator:
+            bad = self._bad_targets(item)
+            if bad:
+                self.rejections.append(bad)
+                raise PlatformActionFailed()
+            self.delivery.record("event.send_streaming", item)
+
+
+async def platform_deliver_or_reject(event) -> str:
+    """respond stage 等效交付：平台拒绝 → 整条消息不投递（线上现象）。
+
+    Returns:
+        "delivered" | "rejected" | "empty"。
+    """
+    result = event.get_result()
+    if not result or not result.chain:
+        return "empty"
+    mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
+    try:
+        await event.send(mc_cls(chain=result.chain))
+    except PlatformActionFailed:
+        return "rejected"
+    return "delivered"
+
+
+def new_platform_event(chain=None, *, platform_valid_qqs=(), trusted_ids="auto",
+                       **event_kwargs):
+    """构造 (plugin, ValidatingPlatformEvent)，共享录制器（T17 用）。"""
+    recorder = DeliveryRecorder()
+    plugin = make_plugin(recorder)
+    event = ValidatingPlatformEvent(
+        chain=chain, platform_valid_qqs=platform_valid_qqs,
+        recorder=recorder, **event_kwargs,
+    )
+    if trusted_ids == "auto":
+        trusted_ids = _auto_trusted_ids(chain)
+    if trusted_ids:
+        mark_tool_confirmed(plugin, event, *trusted_ids)
+    return plugin, event
+
+
+class TestPlatformRejectsInvalidAt:
+    """机制层：平台无法解析的 At → 整条消息被拒（与插件无关的底层事实）。"""
+
+    async def test_invalid_at_kills_whole_message(self):
+        plugin, event = new_platform_event(
+            chain=[Plain("正文内容"), At(qq=LIVE_BOGUS_QQ), Plain(" 结尾")],
+            platform_valid_qqs={MEMBER_QQ},
+            trusted_ids=set(),
+        )
+        await run_llm_request(plugin, event)
+
+        outcome = await platform_deliver_or_reject(event)
+        assert outcome == "rejected", f"含非法 At 的消息应被平台拒绝，实测 {outcome}"
+        assert event.rejections == [[LIVE_BOGUS_QQ]]
+        assert event.delivery.chains() == [], "被拒后正文不得投递（整条消息丢失）"
+
+    async def test_valid_member_at_delivers(self):
+        plugin, event = new_platform_event(
+            chain=[Plain("正文内容"), At(qq=MEMBER_QQ)],
+            platform_valid_qqs={MEMBER_QQ},
+            trusted_ids=set(),
+        )
+        await run_llm_request(plugin, event)
+        outcome = await platform_deliver_or_reject(event)
+        assert outcome == "delivered"
+        assert event.delivery.at_targets() == [MEMBER_QQ]
+
+
+class TestDirectIdMembershipVerification:
+    """T16 四条路径：等效链路（同一输入 + 同一桩平台）。"""
+
+    async def test_pre_fix_semantics_still_kills_whole_message(self):
+        """修复前等效语义（直连号不加成员校验即可信）→ 整条回复被平台拒绝。"""
+        plugin, event = new_platform_event(
+            chain=[Plain(f"就是他 [at:{LIVE_BOGUS_QQ}] 了")],
+            platform_valid_qqs={MEMBER_QQ},
+            # 等效 T16 之前的语义：用户消息里的号直接进可信集
+            trusted_ids={LIVE_BOGUS_QQ},
+            user_message=f"帮我艾特 {LIVE_BOGUS_QQ}",
+        )
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        rendered = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert rendered == [LIVE_BOGUS_QQ], f"前置条件：应渲染出该 At，实测 {rendered}"
+
+        outcome = await platform_deliver_or_reject(event)
+        assert outcome == "rejected", "非法 At 必须导致整条消息被拒（复现线上失败）"
+        assert event.delivery.chains() == [], "正文一并丢失（线上现象）"
+
+    async def test_fixed_degrades_and_body_delivered(self):
+        """修复后：同一输入 → 降级 `@数字`，正文成功交付。"""
+        plugin, event = new_platform_event(
+            chain=[Plain(f"就是他 [at:{LIVE_BOGUS_QQ}] 了")],
+            platform_valid_qqs={MEMBER_QQ},
+            trusted_ids=set(),
+            user_message=f"帮我艾特 {LIVE_BOGUS_QQ}",
+        )
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        rendered = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert rendered == [], f"非本群号不得渲染 At，实测 {rendered}"
+        outcome = await platform_deliver_or_reject(event)
+        assert outcome == "delivered", "降级后必须可交付"
+        assert f"@{LIVE_BOGUS_QQ}" in event.delivery.text_of(-1)
+        assert event.delivery.naked_tags() == []
+
+    async def test_non_member_degrades_without_audit(self, tmp_path, monkeypatch):
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{LIVE_BOGUS_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {LIVE_BOGUS_QQ}",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        assert not any(isinstance(c, At) for c in event.get_result().chain)
+        assert _audit_files(tmp_path) == [], "降级不得写 at_member 审计"
+        assert any("未经工具确认" in w for w in warnings), warnings
+
+    async def test_member_direct_id_renders(self, tmp_path):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{MEMBER_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == [MEMBER_QQ]
+        assert _audit_files(tmp_path), "放行的艾特应写审计"
+
+    async def test_member_list_unavailable_keeps_rendering_with_warning(
+        self, tmp_path, monkeypatch
+    ):
+        """【T24 起翻转】名单不可用（空表/异常/私聊 ⇒ None）→ 直连号降级、正文可交付。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{LIVE_BOGUS_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {LIVE_BOGUS_QQ}",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = []          # 空列表 ≡ _get_group_members_cached → None
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        rendered = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert rendered == [], f"名单不可用时不得渲染 At，实测 {rendered}"
+        text = "".join(
+            c.text for c in event.get_result().chain if isinstance(c, Plain)
+        ).replace("\u200b", "")
+        assert f"@{LIVE_BOGUS_QQ}" in text, f"应降级为 @数字，实测 {text!r}"
+        assert event.get_result().chain, "降级后仍必须是可交付的一条消息"
+        assert any("无法获取群成员名单" in w for w in warnings), warnings
+        assert any("已按未知来源降级" in w for w in warnings), warnings
+
+    async def test_tool_confirmed_unaffected_by_membership_check(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{MEMBER_QQ}] 和 [at:{LIVE_BOGUS_QQ}]")],
+            trusted_ids=set(),
+            user_message="谁在呢",
+        )
+        mark_tool_confirmed(plugin, event, MEMBER_QQ)   # 工具确认
+        event.bot.member_list = []                      # 名单不可用也不影响工具路径
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        targets = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert targets == [MEMBER_QQ], f"工具确认路径不受名单校验影响，实测 {targets}"
+        text = "".join(
+            c.text for c in event.get_result().chain if isinstance(c, Plain)
+        )
+        assert f"@{LIVE_BOGUS_QQ}" in text, "未确认号应降级为纯文本"
+
+
+class TestDirectIdMembershipBoundaries:
+    """边界与误伤：TTL/私聊/空表/异常/大群截断。"""
+
+    async def test_private_chat_without_group_id_keeps_rendering(
+        self, monkeypatch
+    ):
+        """私聊（无 group_id）：拿不到名单。【T24 起翻转】直连号降级为 @数字。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{LIVE_BOGUS_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {LIVE_BOGUS_QQ}",
+            group_id=None,
+            umo="aiocqhttp:FriendMessage:10001",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        rendered = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert rendered == [], f"无群号（名单不可用）时直连号不得渲染 At，实测 {rendered}"
+        text = "".join(
+            c.text for c in event.get_result().chain if isinstance(c, Plain)
+        ).replace("\u200b", "")
+        assert f"@{LIVE_BOGUS_QQ}" in text, f"应降级为 @数字 文本，实测 {text!r}"
+        assert event.get_result().chain, "降级后仍必须是可交付的一条消息"
+        assert any("无法获取群成员名单" in w for w in warnings), warnings
+        assert any("已按未知来源降级" in w for w in warnings), warnings
+
+    async def test_member_list_exception_after_retry_keeps_rendering(self, monkeypatch):
+        """名单接口持续异常（重试耗尽）。
+
+        【T24 起翻转】旧语义渲染 At → 现语义降级为 @数字 + 区分文案 warning；
+        重试退避（~0.5s）仍在，属已知性能代价（README 已记）。
+        """
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{MEMBER_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        event.bot.member_list_fail_times = 99
+        await run_llm_request(plugin, event)
+
+        t0 = time.perf_counter()
+        await run_main_hook(plugin, event)
+        elapsed = time.perf_counter() - t0
+
+        rendered = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert rendered == [], f"名单不可用时直连号不得渲染 At，实测 {rendered}"
+        text = "".join(
+            c.text for c in event.get_result().chain if isinstance(c, Plain)
+        ).replace("\u200b", "")
+        assert f"@{MEMBER_QQ}" in text, "应降级为 @数字 文本"
+        assert any("无法获取群成员名单" in w for w in warnings), warnings
+        assert any("已按未知来源降级" in w for w in warnings), warnings
+        assert elapsed >= 0.5, (
+            f"实测重试退避使渲染阻塞 {elapsed * 1000:.0f}ms（_MEMBER_LIST_RETRY_DELAY=0.5s，"
+            "T24 决定保留：失败窗口每条相关消息 +~0.5s，已记 README 已知限制）"
+        )
+
+    async def test_member_list_outage_keeps_invalid_at_channel(self):
+        """【T24 修复后】名单不可用 + 用户给的是非法号 → 降级、正文成功交付。
+
+        T17 用它复现 F1'（当时渲染 At ⇒ 平台 retcode=1200 整条被拒）；T24 把该分支
+        改为 fail-closed 后，这里翻转断言：不再渲染 At，且整条消息可交付。
+        """
+        plugin, event = new_platform_event(
+            chain=[Plain(f"[at:{LIVE_BOGUS_QQ}]")],
+            platform_valid_qqs={MEMBER_QQ},
+            trusted_ids=set(),
+            user_message=f"艾特 {LIVE_BOGUS_QQ}",
+        )
+        event.bot.member_list = []          # 名单不可用（空表/拉取失败）
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        rendered = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert rendered == [], f"名单不可用时直连号不得进可信集，实测 {rendered}"
+        outcome = await platform_deliver_or_reject(event)
+        assert outcome == "delivered", (
+            "T24 起名单不可用也降级，因此整条消息不再被平台 1200 拒收"
+        )
+        assert event.delivery.chains(), "正文必须成功交付"
+        assert f"@{LIVE_BOGUS_QQ}" in event.delivery.text_of(-1), "降级为 @数字"
+
+    async def test_stale_member_list_degrades_real_member_then_self_heals(self):
+        """【误伤 F2'】名单 TTL 内新入群成员：合法艾特被降级；TTL 后自愈。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{MEMBER_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        stale_bot = event.bot
+        # 名单非空但**过期**：里面还没有他（刚入群 / 180s 缓存未刷新）
+        stale_bot.member_list = [
+            {"user_id": "9000000001", "nickname": "老成员", "card": ""}
+        ]
+        plugin.member_list_cache_ttl = 180   # 生产者配置（默认即 180s）
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert not any(isinstance(c, At) for c in event.get_result().chain), (
+            "名单里查不到的合法成员会被降级（误伤）"
+        )
+
+        # 名单刷新后（同一会话下一轮）应恢复渲染
+        refreshed = FakeBot(members=[{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}])
+        plugin._member_cache.clear()
+        event2 = FakeEvent(
+            chain=[Plain(f"[at:{MEMBER_QQ}]")],
+            sender_id=event.get_sender_id(),
+            umo=event.unified_msg_origin,
+            group_id=event.get_group_id(),
+            bot=refreshed,
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        await run_llm_request(plugin, event2)
+        await run_main_hook(plugin, event2)
+        assert [str(c.qq) for c in event2.get_result().chain if isinstance(c, At)] == [
+            MEMBER_QQ
+        ], "名单刷新后应恢复渲染（误伤是暂时的）"
+
+    async def test_truncated_member_list_degrades_real_member(self):
+        """【误伤 F3'】平台返回被截断的成员名单（大群）→ 名单外的合法成员被降级。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{MEMBER_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        # 平台只返回了前 100 人的名单（大群常见截断），目标成员在截断之外
+        event.bot.member_list = [
+            {"user_id": f"900000{i:04d}", "nickname": f"成员{i}", "card": ""}
+            for i in range(100)
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        assert not any(isinstance(c, At) for c in event.get_result().chain), (
+            "截断名单下的合法成员同样被降级（误伤，需平台侧确认是否真会截断）"
+        )
+
+
+class TestDirectIdMembershipSideEffects:
+    """网络调用频率 / send 与分段路径 / 审计语义。"""
+
+    @staticmethod
+    def _member_list_calls(bot) -> int:
+        return sum(1 for (action, _kw) in bot.calls if action == "get_group_member_list")
+
+    async def test_no_member_list_call_when_message_has_no_digits(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("普通回复，没有标签")], trusted_ids=set()
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert self._member_list_calls(event.bot) == 0, "无数字则不应触发表拉取"
+
+    async def test_member_list_fetched_even_when_reply_has_no_tag(self):
+        """【观察】只要用户消息含 5..12 位数字，即使回复没有任何标签也会拉一次名单。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("普通回复，没有标签")],
+            trusted_ids=set(),
+            user_message="帮我看看 19999 这个价格",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert self._member_list_calls(event.bot) == 1, (
+            "渲染路径新增了一次成员名单拉取（T16 副作用，180s 缓存内只发生一次）"
+        )
+
+    async def test_member_list_fetch_is_cached_within_ttl(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{MEMBER_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        first = self._member_list_calls(event.bot)
+
+        for _ in range(3):                      # 同会话再来三轮
+            event.set_chain([Plain(f"[at:{MEMBER_QQ}]")])
+            await run_main_hook(plugin, event)
+        assert self._member_list_calls(event.bot) == first == 1, (
+            f"180s TTL 内不得重复拉取，实测 {self._member_list_calls(event.bot)} 次"
+        )
+
+    async def test_send_path_and_splitter_unaffected(self):
+        """分段 + send 包装路径：成员号渲染、非成员号降级、不变量保持。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"甲段\n\n乙段 [at:{MEMBER_QQ}] 与 [at:{LIVE_BOGUS_QQ}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ} 和 {LIVE_BOGUS_QQ}",
+        )
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await splitter_real_path(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.at_targets() == [MEMBER_QQ], (
+            f"只应渲染本群成员，实测 {event.delivery.at_targets()}"
+        )
+        assert event.delivery.naked_tags() == []
+        all_text = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        assert f"@{LIVE_BOGUS_QQ}" in all_text, "非成员号应以纯文本保留"
+
+    async def test_streaming_path_membership_check(self):
+        plugin, event = new_plugin_and_event(
+            chain=[],
+            trusted_ids=set(),
+            user_message=f"艾特 {MEMBER_QQ}",
+        )
+        event.bot.member_list = [{"user_id": MEMBER_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
+
+        async def gen():
+            yield mc_cls(chain=[Plain(f"甲 [at:{MEMBER_QQ}]")])
+            yield mc_cls(chain=[Plain(f"乙 [at:{LIVE_BOGUS_QQ}]")])
+
+        await event.send_streaming(gen(), False)
+        assert event.delivery.at_targets() == [MEMBER_QQ]
+        assert event.delivery.naked_tags() == []

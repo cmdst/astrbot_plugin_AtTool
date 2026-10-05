@@ -889,7 +889,8 @@ class LLMAtToolPlugin(Star):
 
         # ⓪ 成员 ID 可信来源判定（T10 / T14-B1 fail-closed）：只认两类 ID——
         #    (a) 本会话内工具确认过的（_known_at_ids，按发起者分槽）；
-        #    (b) 用户消息里明确出现的 QQ 号（allow_direct_qq_at=true 时）。
+        #    (b) 用户消息里明确出现、且**是本群成员**的 QQ 号
+        #        （allow_direct_qq_at=true 时）。
         #    取不到用户上下文（无 message_str 也无入站链）时可信集退化为 (a)，
         #    编造 ID 一律降级 —— 绝不因"读不到用户消息"而放行（T12 B1）。
         #    该可信集必须早于 ①b 跨组件拼合构造，供拼合路径共用同一份判定
@@ -904,13 +905,41 @@ class LLMAtToolPlugin(Star):
             incoming = event.get_messages()
         except Exception:
             incoming = None
+        direct_ids: set = set()
         if self.allow_direct_qq_at:
             if msg_text:
-                trusted_ids |= set(USER_QQ_PATTERN.findall(msg_text))
+                direct_ids |= set(USER_QQ_PATTERN.findall(msg_text))
             for in_comp in incoming or []:
                 if isinstance(in_comp, Plain):
-                    trusted_ids |= set(USER_QQ_PATTERN.findall(in_comp.text))
-        # 未经工具确认 / 未出现在用户消息里的成员 ID（聚合告警用）
+                    direct_ids |= set(USER_QQ_PATTERN.findall(in_comp.text))
+        if direct_ids:
+            # T16：直连号必须过本群成员名单。平台（NapCat/OneBot）对无法解析的
+            # QQ 会以 retcode=1200 "Get Uid Error" 拒绝**整条消息**（线上实测
+            # 22:02 respond.stage:322，正文全丢），因此只有名单内的号码才可信；
+            # 不在名单内的号码不进 trusted_ids ⇒ 走既有 degrade（@数字 + 聚合告警）。
+            group_id = event.get_group_id() or ""
+            raw_members = (
+                await self._get_group_members_cached(event, group_id)
+                if group_id
+                else None
+            )
+            if raw_members is None:
+                # T24/F1'（fail-closed）：名单不可用（非群聊/拉取失败/平台返回为空）
+                # 时**不得**放行直连号——否则非法 At 会被平台以 retcode=1200
+                # "Get Uid Error" 拒绝，整条回复连正文一起丢（线上 22:02 实测）。
+                # 直连号一律按未知来源处理：不进可信集 ⇒ 走既有 degrade（@数字）。
+                logger.warning(
+                    "无法获取群成员名单（非群聊/拉取失败/平台返回为空），本轮直连 "
+                    "QQ 号已按未知来源降级（不渲染 At）："
+                    f"{sorted(direct_ids)}（会话 {umo}）；若平台报 retcode=1200 或长期"
+                    "拉不到名单，请检查适配器 get_group_member_list 权限/大群截断。"
+                )
+            else:
+                member_ids = {
+                    str(m.get("user_id", "")) for m in raw_members if m
+                }
+                trusted_ids |= direct_ids & member_ids
+        # 未经工具确认 / 未出现在用户消息里 / 不是本群成员的 ID（聚合告警用）
         untrusted_ids: list[str] = []
 
         # ① 合并相邻 Plain：修复标签被第三方插件拆分到相邻组件的情况
@@ -1115,7 +1144,8 @@ class LLMAtToolPlugin(Star):
         if not untrusted_ids:
             return
         logger.warning(
-            "检测到未经工具确认的艾特 ID（疑似编造/上游残留），已降级为纯文本 "
+            "检测到未经工具确认、或不在本群成员名单的艾特 ID（疑似编造/上游"
+            "残留），已降级为纯文本 "
             f"@{'、@'.join(dict.fromkeys(untrusted_ids))}"
             f"（会话 {umo}；本轮用户消息与工具结果均未提供该 ID）"
         )

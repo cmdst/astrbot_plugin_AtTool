@@ -370,10 +370,13 @@ class TestTrustedIdSource:
 
     async def test_user_message_qq_renders_when_direct_allowed(self, tmp_path):
         """用户消息里明确给出的 QQ 号（allow_direct_qq_at=true）→ 正常渲染。"""
-        # (a) 来源是 event.message_str
+        # (a) 来源是 event.message_str（T16 起该号还需是本群成员）
         plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
         ev = FakeEvent(chain=[Plain(f"来了 [at:{self.FABRICATED[1]}]")])
         ev.message_str = f"帮我艾特 {self.FABRICATED[1]} 谢谢"
+        ev.bot.member_list = [
+            {"user_id": self.FABRICATED[1], "nickname": "陨落星辰", "card": "", "role": "member"}
+        ]
         await plugin.process_at_tags(ev)
         assert _ats(ev.get_result().chain) == [self.FABRICATED[1]]
 
@@ -386,6 +389,9 @@ class TestTrustedIdSource:
             incoming=[Plain(f"艾特下 {self.FABRICATED[0]}")],
         )
         ev2.message_str = ""  # 入站链存在即视为有用户上下文
+        ev2.bot.member_list = [
+            {"user_id": self.FABRICATED[0], "nickname": "张三", "card": "", "role": "member"}
+        ]
         await plugin2.process_at_tags(ev2)
         assert _ats(ev2.get_result().chain) == [self.FABRICATED[0]]
 
@@ -572,6 +578,133 @@ class TestTrustedIdSource:
         )
         assert f"@{self.FABRICATED[1]}" in "".join(_plain_texts(chain))
         assert any("未经工具确认" in str(w) for w in warnings), warnings
+
+
+class TestDirectQqGroupMembership:
+    """T16：直连 QQ 号必须过**本群成员名单**才能渲染成 At。
+
+    线上实测（22:02，群 744868236）：用户给了自编号 1645896432（"是1645896432了"），
+    模型直接输出 ``[at:1645896432]``；该号在当轮用户消息里 ⇒ v2.6.1 的"用户提供的
+    QQ 可信"规则让它渲染成 At，但平台以 ``retcode=1200 Get Uid Error`` **拒绝整条
+    消息**（``respond.stage:322``），群里正文全丢。故直连号必须先在本群成员名单里。
+    """
+
+    LIVE_BOGUS = "1645896432"  # 线上实测：用户自编、非本群成员的号码
+    MEMBER = "3882563785"  # 真实群成员（测试名单里）
+
+    @staticmethod
+    def _member_list():
+        return [
+            {
+                "user_id": TestDirectQqGroupMembership.MEMBER,
+                "nickname": "陨落星辰",
+                "card": "",
+                "role": "member",
+            }
+        ]
+
+    async def test_non_member_direct_id_degrades_and_message_survives(
+        self, monkeypatch, tmp_path
+    ):
+        """① 非本群成员的直连号 → 降级为 `@数字`、消息可交付、无 at_member 审计。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id="10001",
+            chain=[Plain(f"[at:{self.LIVE_BOGUS}] 抓到一只隐身的小可爱啦~")],
+        )
+        ev.message_str = f"是{self.LIVE_BOGUS}了"
+        ev.bot.member_list = self._member_list()  # 名单里没有这个号
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "非本群号不得渲染成 At"
+        assert f"@{self.LIVE_BOGUS}" in "".join(_plain_texts(chain))
+        # 复用既有成员缓存：工具调用已拉过一次，渲染判定不得再打一次 API
+        assert [
+            call for call in ev.bot.calls if call[0] == "get_group_member_list"
+        ].__len__() == 1, "直连号成员校验必须复用 _get_group_members_cached 的缓存"
+        assert chain, "降级后仍必须是一条可交付的消息"
+        assert_n1(chain)
+        assert not audit_file(tmp_path, datetime.now().strftime("%Y%m%d")).exists(), (
+            "被拒绝的直连号不得写 at_member 审计"
+        )
+        assert any("未经工具确认" in str(w) for w in warnings), warnings
+
+    async def test_member_direct_id_renders(self, tmp_path):
+        """② 当轮用户消息里给出的**真实群成员**号 → 照常渲染 At。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id="10001",
+            chain=[Plain(f"[at:{self.MEMBER}] 来")],
+        )
+        ev.message_str = f"帮我艾特 {self.MEMBER} 谢谢"
+        ev.bot.member_list = self._member_list()
+        await plugin.process_at_tags(ev)
+
+        assert _ats(ev.get_result().chain) == [self.MEMBER]
+        assert_n1(ev.get_result().chain)
+
+    async def test_member_list_unavailable_keeps_rendering_with_warning(
+        self, monkeypatch, tmp_path
+    ):
+        """③【T24 起翻转】名单不可用（非群聊/拉取为空/异常 ⇒ None）→ **降级**。
+
+        旧语义（T16）是"查不到名单就保持原行为渲染 At"，但线上实测表明该分支同
+        样会被平台以 retcode=1200 Get Uid Error 拒绝、整条回复连正文一起丢，因此
+        T24 改为 fail-closed：直连号按未知来源降级为 `@数字` + 区分文案 warning。
+        """
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id="10001",
+            chain=[Plain(f"[at:{self.LIVE_BOGUS}] 来")],
+        )
+        ev.message_str = f"是{self.LIVE_BOGUS}了"
+        ev.bot.member_list = []  # 空/异常/私聊都归到 None 分支
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), (
+            "名单不可用时直连号不得渲染 At（否则整条消息可能被平台拒收）"
+        )
+        assert f"@{self.LIVE_BOGUS}" in "".join(_plain_texts(chain)), "降级为 @数字"
+        assert chain, "降级后仍必须是一条可交付的消息"
+        assert_n1(chain)
+        assert any("无法获取群成员名单" in str(w) for w in warnings), warnings
+        assert any("已按未知来源降级" in str(w) for w in warnings), warnings
+
+    async def test_tool_confirmed_path_unaffected_by_membership_check(
+        self, monkeypatch, tmp_path
+    ):
+        """④ 工具确认路径不受影响：命中 ID 本就来自成员名单，仍直接渲染。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id="10001", chain=[])
+        ev.message_str = f"是{self.LIVE_BOGUS}了"  # 用户只给了编造号
+        ev.bot.member_list = self._member_list()
+        text = await plugin.search_and_mention(ev, "陨落星辰")  # 工具确认 MEMBER
+        assert self.MEMBER in text
+
+        ev.set_chain([Plain(f"[at:{self.MEMBER}] 和 [at:{self.LIVE_BOGUS}]")])
+        await plugin.process_at_tags(ev)
+        chain = ev.get_result().chain
+        assert _ats(chain) == [self.MEMBER], (
+            "工具确认路径不受名单校验影响；非本群的直连号仍降级"
+        )
+        assert f"@{self.LIVE_BOGUS}" in "".join(_plain_texts(chain))
 
 
 class TestStreamingFormRows:

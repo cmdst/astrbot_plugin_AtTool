@@ -1,7 +1,7 @@
 name: astrbot_plugin_AtTool
 display_name: "@工具（艾特工具）"
 desc: "让 LLM 拥有真实艾特群成员能力的插件 - 重制版"
-version: v2.6.1
+version: v2.6.2
 author: 糯米茨
 repo: https://github.com/cmdst/astrbot_plugin_AtTool
 astrbot_version: ">=4.26.0"
