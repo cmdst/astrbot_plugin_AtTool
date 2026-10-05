@@ -3013,6 +3013,8 @@ class TestIntentTriggerRulesText:
         assert "绝对不要调用工具、也不要输出标签" in prompt
 
         assert "只是想**查询**某人的 QQ 号 / 群名片" in prompt, "L1：纯查询指引缺失"
+        # T38：纯查询也要"先调用工具查"，避免模型凭记忆作答（幻觉）
+        assert "先调用工具查询" in prompt, "T38：纯查询缺「先调工具」指引"
         assert "不要在正文里输出 [at:ID] 标签" in prompt, (
             "L1：纯查询场景必须显式禁止输出 [at:ID]"
         )
@@ -3037,3 +3039,341 @@ class TestIntentTriggerRulesText:
         i_intent = prompt.index(T29_SECTION_HEAD)
         assert i_static < i_intent, "T28 小节必须在用户静态提示词之后（recency）"
         assert "不是他用了哪个词" in prompt[i_intent:], "必须有否定关键词口径的原句"
+
+
+# =========================================================================== #
+# T35 追加：降级文案方案 C（「（不在本群）」标记）语义验证
+#   标记必须是一句真话：只在"名单可用且 ID 不在名单内"时出现；
+#   逐组件与跨组件拼合两条路径同口径。
+# =========================================================================== #
+
+MARK_NOT_IN_GROUP = "（不在本群）"
+_T35_BOGUS = "436797884"       # 名单可解析但不在名单里的号码
+_T35_OTHER = "988776655"       # 另一个群成员（用作昵称降级目标，避免命中自目标例外）
+
+
+def t35_marker_count(text: str) -> int:
+    return text.count(MARK_NOT_IN_GROUP)
+
+
+class TestDegradeMarkerSemantics:
+    """acceptance ①–⑤。"""
+
+    async def test_marker_when_list_available_and_id_absent(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"好的 [at:{_T35_BOGUS}] 收到")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message=f"艾特 {_T35_BOGUS}",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": "柴郡"}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        chain = event.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "不在名单的 ID 不得渲染 At"
+        text = _plain_text(chain)
+        assert f"@{_T35_BOGUS}{MARK_NOT_IN_GROUP}" in text, f"实测 {text!r}"
+
+    async def test_no_marker_when_list_empty(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {_T35_BOGUS}",
+        )
+        event.bot.member_list = []          # 名单不可用
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert f"@{_T35_BOGUS}" in text
+        assert MARK_NOT_IN_GROUP not in text, f"名单不可用属未知，不得加标记：{text!r}"
+
+    async def test_no_marker_when_fetch_fails(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {_T35_BOGUS}",
+        )
+        event.bot.member_list_fail_times = 99     # 重试耗尽
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert f"@{_T35_BOGUS}" in text and MARK_NOT_IN_GROUP not in text, repr(text)
+
+    async def test_no_marker_in_private_chat(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {_T35_BOGUS}",
+            group_id=None,
+            umo="aiocqhttp:FriendMessage:10001",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert f"@{_T35_BOGUS}" in text and MARK_NOT_IN_GROUP not in text, repr(text)
+
+    async def test_nickname_used_without_marker(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_OTHER}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "自己", "card": ""},
+            {"user_id": _T35_OTHER, "nickname": "陨落星辰", "card": "柴郡"},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert "@柴郡" in text, f"应使用群名片，实测 {text!r}"
+        assert MARK_NOT_IN_GROUP not in text, "昵称降级不得加标记"
+        assert _T35_OTHER not in text, "有昵称时不应露裸号码"
+
+    async def test_tool_confirmed_and_self_target_render_true_at(self):
+        # 工具确认路径
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_OTHER}]")], trusted_ids=set(),
+            sender_id=SELF_QQ, user_message="你好",
+        )
+        mark_tool_confirmed(plugin, event, _T35_OTHER)
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "自己", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == [_T35_OTHER]
+
+        # 自目标例外（发送者在名单内）
+        plugin2, event2 = new_plugin_and_event(
+            chain=[Plain(f"[at:{SELF_QQ}]")], trusted_ids=set(),
+            sender_id=SELF_QQ, user_message="你好",
+        )
+        event2.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": "柴郡"}]
+        await run_llm_request(plugin2, event2)
+        await run_main_hook(plugin2, event2)
+        assert [str(c.qq) for c in event2.get_result().chain if isinstance(c, At)] == [SELF_QQ]
+
+    async def test_cross_component_path_same_marker(self):
+        """⑤ 跨组件拼合路径与逐组件路径同口径（同一号码同一文案）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:43679"), At(qq="999"), Plain("7884] 尾巴")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": "柴郡"}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert f"@{_T35_BOGUS}{MARK_NOT_IN_GROUP}" in text, f"拼合路径文案不一致：{text!r}"
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["999"], (
+            "链内既有 At 必须保留"
+        )
+
+    async def test_cross_component_path_uses_nickname_too(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:98877"), At(qq="999"), Plain("6655]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "自己", "card": ""},
+            {"user_id": _T35_OTHER, "nickname": "陨落星辰", "card": "柴郡"},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        text = _plain_text(event.get_result().chain)
+        assert "@柴郡" in text and MARK_NOT_IN_GROUP not in text, repr(text)
+
+
+class TestDegradeMarkerAttacks:
+    """专项攻击：标记是不是一句真话 / 会不会被混淆。"""
+
+    async def test_stale_list_makes_false_not_in_group_claim(self):
+        """【finding F1】名单非空但过期（成员刚入群）→ 会声称"不在本群"，而事实相反。
+
+        本用例钉住当前行为（误报），修好/改文案后应失效并更新。
+        """
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{SELF_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        # 名单过期/未刷新：不含刚入群的 SELF_QQ（但此人实际就在群里发言）
+        event.bot.member_list = [{"user_id": _T35_BOGUS, "nickname": "老成员", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert f"@{SELF_QQ}{MARK_NOT_IN_GROUP}" in text, (
+            "实测：名单过期时会输出「不在本群」（对实际在群成员是假话）"
+        )
+
+    async def test_truncated_list_makes_false_claim(self):
+        """【finding F1 变体】大群名单被截断 → 名单外的真实成员被判"不在本群"。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_OTHER}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [
+            {"user_id": f"900000{i:04d}", "nickname": f"成员{i}", "card": ""}
+            for i in range(100)
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        text = _plain_text(event.get_result().chain)
+        assert f"@{_T35_OTHER}{MARK_NOT_IN_GROUP}" in text
+
+    async def test_nickname_containing_marker_text_is_ambiguous(self):
+        """【finding F2】群名片本身就含「（不在本群）」→ 与系统标记无法区分。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        ambiguous = f"柴郡{MARK_NOT_IN_GROUP}"
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "自己", "card": ""},
+            {"user_id": _T35_BOGUS, "nickname": ambiguous, "card": ambiguous},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert text.count(MARK_NOT_IN_GROUP) == 1, f"实测 {text!r}"
+
+    async def test_numeric_nickname_suppresses_marker(self):
+        """【finding F3】群名片是纯数字时走昵称分支 → 标记被吞，读者无法区分。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "自己", "card": ""},
+            {"user_id": _T35_BOGUS, "nickname": _T35_BOGUS, "card": _T35_BOGUS},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        text = _plain_text(event.get_result().chain)
+        assert f"@{_T35_BOGUS}" in text and MARK_NOT_IN_GROUP not in text, repr(text)
+
+    async def test_card_with_tag_syntax_falls_back_to_number(self):
+        """回归护栏（T21/F1' 已修）：名片含标签语法 ⇒ 丢弃名字、回退号码且不穿链。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"第一段 [at:{_T35_BOGUS}] 尾巴\n\n第二段正文")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+        )
+        evil = f"[at:{LIVE_BOGUS_QQ}]"
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "自己", "card": ""},
+            {"user_id": _T35_BOGUS, "nickname": evil, "card": evil},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await splitter_real_path(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.naked_tags() == [], "名片里的标签语法不得进群"
+        assert event.delivery.at_targets() == []
+        joined = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        # 该 ID 本身**在**成员名单里（只是名字不可用）⇒ 不加「不在本群」标记，
+        # 回退为裸号码；这正好验证标记只取决于"是否在名单"，与名字可用性无关
+        assert f"@{_T35_BOGUS}" in joined, repr(joined)
+        assert MARK_NOT_IN_GROUP not in joined, repr(joined)
+
+    async def test_degrade_text_makes_no_other_claims(self):
+        """标记语义限定：降级文案只陈述"不在本群"，不得出现其它断言。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": "柴郡"}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        text = _plain_text(event.get_result().chain)
+        for claim in ("已艾特", "已通知", "未找到", "不在群", "该成员不存在"):
+            assert claim not in text, f"不得出现超出语义的断言 {claim!r}：{text!r}"
+
+
+class TestDegradeMarkerE2E:
+    """完整交付：主钩子 + send 包装器 + splitter 直发 + 流式。"""
+
+    async def test_full_delivery_no_naked_no_unexpected_at(self, tmp_path):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"甲段 [at:{_T35_BOGUS}] 尾巴\n\n乙段 [at:{_T35_OTHER}] 收尾")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "自己", "card": ""},
+            {"user_id": _T35_OTHER, "nickname": "陨落星辰", "card": "柴郡"},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await splitter_real_path(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.naked_tags() == [], "不得出现裸标签"
+        assert event.delivery.at_targets() == [], "两条降级都不得渲染 At"
+        joined = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        assert f"@{_T35_BOGUS}{MARK_NOT_IN_GROUP}" in joined, "非成员号带标记"
+        assert "@柴郡" in joined, "成员号用昵称"
+        assert joined.strip(), "正文必须可交付"
+        assert _audit_files(tmp_path) == [], "降级不写 at_member 审计"
+
+    async def test_streaming_delivery_marks_non_member(self):
+        plugin, event = new_plugin_and_event(
+            chain=[], trusted_ids=set(), sender_id=SELF_QQ, user_message="你好"
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": "柴郡"}]
+        await run_llm_request(plugin, event)
+        mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
+
+        async def gen():
+            yield mc_cls(chain=[Plain(f"流式 [at:{_T35_BOGUS}]")])
+
+        await event.send_streaming(gen(), False)
+        assert event.delivery.naked_tags() == []
+        assert event.delivery.at_targets() == []
+        assert f"@{_T35_BOGUS}{MARK_NOT_IN_GROUP}" in event.delivery.text_of(-1)
+
+    async def test_third_party_clear_and_send_path_marks_correctly(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"前段\n\n后段 [at:{_T35_BOGUS}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": "柴郡"}]
+        await run_llm_request(plugin, event)
+        await third_party_clear_and_send_each(plugin, event)
+        await run_main_hook(plugin, event)
+
+        assert event.delivery.naked_tags() == []
+        assert event.delivery.at_targets() == []
+        joined = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        assert f"@{_T35_BOGUS}{MARK_NOT_IN_GROUP}" in joined, repr(joined)

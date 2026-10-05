@@ -3,6 +3,7 @@ import json
 import re
 import time
 from datetime import datetime
+from collections.abc import Callable
 from typing import Any, List, Optional, Tuple
 
 from astrbot.api.star import Context, Star, StarTools
@@ -494,8 +495,8 @@ class LLMAtToolPlugin(Star):
             "- 用户说「别艾特任何人」「不要 @ 他」这类否定指令时：绝对不要调用工具、"
             "也不要输出标签。\n"
             "用户直接给出 QQ 号时按「QQ号处理」小节处理，本节不改变该分支的约束。\n"
-            "用户只是想**查询**某人的 QQ 号 / 群名片（而不是要让他回应）时：直接用"
-            "文字把信息告诉他，**不要在正文里输出 [at:ID] 标签**。"
+            "用户只是想**查询**某人的 QQ 号 / 群名片（而不是要让他回应）时：**可以"
+            "先调用工具查询**，再用文字把信息告诉他，**不要在正文里输出 [at:ID] 标签**。"
         )
         # 新增：多成员选择说明（CHG-05）
         parts.append(
@@ -979,8 +980,11 @@ class LLMAtToolPlugin(Star):
             # 原文带进群（非末段经 splitter 的 context.send_message 直发，不经本
             # 插件二次渲染）⇒ 丢弃该名字、回退为号码。复用 has_at_tag 以覆盖
             # 大小写/空白/全角/零宽变体，不另写正则。
+            # T38/F3：纯数字的名字不得当显示名——`@1234567` 既分不清是昵称还是
+            # 号码，又会被误当成"这个人的 QQ 号"，与用户反馈的"@数字看着像真艾特"
+            # 同型；此时回退为 `@<真实号>`（名单内不加「不在本群」标记）。
             name = str(member.get("card") or member.get("nickname") or "").strip()
-            if name and not has_at_tag(name):
+            if name and not has_at_tag(name) and not name.isdigit():
                 member_names[uid] = name
         if direct_ids:
             # T16：直连号必须过本群成员名单。平台（NapCat/OneBot）对无法解析的
@@ -1000,6 +1004,27 @@ class LLMAtToolPlugin(Star):
                 )
             else:
                 trusted_ids |= direct_ids & member_ids
+        def degrade_text(user_id: str) -> str:
+            """不可信成员 ID 的降级文案（逐组件与跨组件拼合路径共用）。
+
+            T34（方案 C）：用户会把纯文本 `@号码` 误认为真艾特，因此只有
+            **成员名单可用且该 ID 不在名单内**（=确实知道不在本群）时才加
+            「（不在本群）」标记；名单不可用（拉取失败/空表/私聊）属未知，
+            只输出 `@号码`；能解析出群名片/昵称时用 `@昵称` 且不加标记。
+
+            Args:
+                user_id: 无法渲染成真 At 的成员 ID（纯数字字符串）。
+
+            Returns:
+                可直接放进消息链的纯文本降级文案。
+            """
+            name = member_names.get(user_id)
+            if name:
+                return "@" + name
+            if raw_members is not None and user_id not in member_ids:
+                return f"@{user_id}（不在本群）"
+            return "@" + user_id
+
         if sender_id and group_id and sender_id in member_ids:
             # T20 窄例外（T26/F2' 收紧）：模型想艾特"当前正在跟它说话的人"是常见
             # 合法意图，而该 ID 由事件本身提供（event.get_sender_id()），不依赖
@@ -1036,7 +1061,7 @@ class LLMAtToolPlugin(Star):
         #     第 13 行）。拼出的成员 ID 必须过同一份 trusted_ids：不可信时
         #     按 degrade 语义降级为 @载荷（不渲染、也不静默删除）
         reassembled = self._merge_split_at_tags(
-            merged_input, umo, trusted_ids, untrusted_ids, member_names
+            merged_input, umo, trusted_ids, untrusted_ids, degrade_text
         )
         if reassembled is not None:
             merged_input = reassembled
@@ -1153,7 +1178,7 @@ class LLMAtToolPlugin(Star):
                     # T10：编造/上游残留的 ID 不得渲染成真实艾特（误伤无关成员）
                     # T20：能从成员名单解析出群名片/昵称时不要露裸号码
                     untrusted_ids.append(value)
-                    new_chain.append(Plain("@" + (member_names.get(value) or value)))
+                    new_chain.append(Plain(degrade_text(value)))
                 else:
                     new_chain.append(At(qq=value))
                     at_member_targets.append(value)
@@ -1227,7 +1252,7 @@ class LLMAtToolPlugin(Star):
         umo: str,
         trusted_ids: set,
         untrusted_ids: list,
-        member_names: dict,
+        degrade_text: Callable[[str], str],
     ) -> list[BaseMessageComponent] | None:
         """P0-1 跨组件拼合：把被非 Plain 组件切碎的标签拼回并渲染为 At。
 
@@ -1245,7 +1270,8 @@ class LLMAtToolPlugin(Star):
             umo: 当前会话标识（仅用于告警日志）。
             trusted_ids: 与逐组件路径共用的同一份可信 ID 集合（T14-B2）。
             untrusted_ids: 本轮渲染中不可信 ID 的聚合列表（调用方负责告警）。
-            member_names: user_id → 群名片/昵称（T20 降级文案用；可为空）。
+            degrade_text: 不可信 ID → 降级文案（T34：与逐组件路径共用同一份
+                判定，含「（不在本群）」标记与昵称回退逻辑）。
 
         Returns:
             重建后的链；无需拼合时返回 None（调用方保持原链不变）。
@@ -1260,7 +1286,7 @@ class LLMAtToolPlugin(Star):
                 if not isinstance(comp, Plain) or not has_at_tag(comp.text):
                     continue
                 hit = self._try_merge_split_at_tag(
-                    working, idx, umo, trusted_ids, untrusted_ids, member_names
+                    working, idx, umo, trusted_ids, untrusted_ids, degrade_text
                 )
                 if hit is not None:
                     break
@@ -1277,7 +1303,7 @@ class LLMAtToolPlugin(Star):
         umo: str,
         trusted_ids: set,
         untrusted_ids: list,
-        member_names: dict,
+        degrade_text: Callable[[str], str],
     ) -> list[BaseMessageComponent] | None:
         """尝试用 chain[idx] 起的跨组件文本拼出一个完整成员标签（P0-1）。
 
@@ -1291,7 +1317,7 @@ class LLMAtToolPlugin(Star):
             umo: 当前会话标识（仅用于告警日志）。
             trusted_ids: 与逐组件路径共用的同一份可信 ID 集合（T14-B2）。
             untrusted_ids: 不可信 ID 聚合列表（本函数只追加，调用方统一告警）。
-            member_names: user_id → 群名片/昵称（T20 降级文案用；可为空）。
+            degrade_text: 不可信 ID → 降级文案（与逐组件路径共用同一份判定）。
 
         Returns:
             重建后的链；无法拼合时返回 None。
@@ -1343,9 +1369,7 @@ class LLMAtToolPlugin(Star):
             if head_text:
                 rebuilt.append(Plain(head_text))
             rebuilt.append(
-                At(qq=target_id)
-                if trusted
-                else Plain("@" + (member_names.get(target_id) or target_id))
+                At(qq=target_id) if trusted else Plain(degrade_text(target_id))
             )
             consumed_map = dict(consumption)
             for j in range(idx + 1, len(chain)):

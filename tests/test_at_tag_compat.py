@@ -917,6 +917,7 @@ class TestIntentBasedTriggerRules:
         assert "先用一句话反问他指的是谁" in text
         assert "别艾特任何人" in text and "不要 @ 他" in text
         assert "只是想**查询**某人的 QQ 号 / 群名片" in text
+        assert "先调用工具查询" in text  # T38：纯查询也要先调工具
         assert "不要在正文里输出 [at:ID] 标签" in text
 
     async def test_intent_rule_reaches_system_prompt_with_tool(self, tmp_path):
@@ -951,6 +952,192 @@ class TestIntentBasedTriggerRules:
         text_off = off._build_dynamic_instructions()
         assert "即使用户直接提供了QQ号，你也必须调用 search_and_mention 工具" in text_off
         assert "确认该成员存在后才可以使用 [at:ID] 标签" in text_off
+
+
+class TestNonMemberDegradeMarker:
+    """T34（方案 C）：只有"确认不在本群"时，降级文案才带「（不在本群）」标记。
+
+    用户复测把降级后的纯文本 `@436797884` 误认为真艾特（QQ 的 @数字 样式接近
+    艾特）。判定必须严格：名单**可用且该 ID 不在名单内** ⇒ `@号码（不在本群）`；
+    名单不可用（拉取失败/空表/私聊）⇒ 只说 `@号码`（未知，不得下结论）；
+    能解析出群名片/昵称 ⇒ `@昵称`（无标记）。
+    """
+
+    SELF = "2060958352"
+    MEMBER = "3882563785"
+    STRANGER = "436797884"  # 用户复测里的自编号码
+    STRANGER2 = "1645896432"
+
+    @staticmethod
+    def _members(*user_ids):
+        return [
+            {"user_id": uid, "nickname": f"成员{uid}", "card": ""} for uid in user_ids
+        ]
+
+    async def test_not_in_group_id_gets_marker(self, monkeypatch, tmp_path):
+        """名单可用且号码不在名单 → `@号码（不在本群）`，不渲染 At、不写审计、带聚合告警。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id=self.SELF,
+            chain=[Plain(f"好的 [at:{self.STRANGER}]")],
+        )
+        ev.message_str = "你好"
+        ev.bot.member_list = self._members(self.MEMBER)
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        text = "".join(_plain_texts(chain))
+        assert f"@{self.STRANGER}（不在本群）" in text, f"实测 {text!r}"
+        assert not any(isinstance(c, At) for c in chain), "仍不得渲染真 At"
+        assert_n1(chain)
+        assert not audit_file(tmp_path, datetime.now().strftime("%Y%m%d")).exists(), (
+            "降级不写 at_member 审计"
+        )
+        assert any("未经工具确认" in str(w) for w in warnings), (
+            f"降级必须留聚合告警，实测 {warnings}"
+        )
+
+    async def test_no_marker_when_member_list_unavailable(
+        self, monkeypatch, tmp_path
+    ):
+        """名单不可用（空表/拉取失败/私聊 ⇒ 未知）→ 只说 `@号码`，不得加标记。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        for label, member_list, group_id in (
+            ("empty", [], "1000"),
+            ("private", None, None),
+        ):
+            plugin = make_plugin(
+                config={"allow_direct_qq_at": True}, audit_dir=tmp_path
+            )
+            ev = FakeEvent(
+                group_id=group_id,
+                sender_id=self.SELF,
+                umo=None if group_id else "aiocqhttp:FriendMessage:10001",
+                chain=[Plain(f"好的 [at:{self.STRANGER}]")],
+            )
+            ev.message_str = "你好"
+            if member_list is not None:
+                ev.bot.member_list = member_list
+            await plugin.process_at_tags(ev)
+
+            text = "".join(_plain_texts(ev.get_result().chain))
+            assert f"@{self.STRANGER}" in text, f"[{label}] 实测 {text!r}"
+            assert "不在本群" not in text, (
+                f"[{label}] 名单不可用时不得下「不在本群」结论，实测 {text!r}"
+            )
+        assert any("未经工具确认" in str(w) for w in warnings), warnings
+
+    async def test_nickname_wins_and_keeps_no_marker(self, tmp_path):
+        """能解析出群名片/昵称时用 `@昵称`，且不加任何标记。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id=self.SELF,
+            chain=[Plain(f"好的 [at:{self.MEMBER}]")],
+        )
+        ev.message_str = "你好"
+        ev.bot.member_list = [
+            {"user_id": self.MEMBER, "nickname": "陨落星辰", "card": "柴郡"}
+        ]
+        await plugin.process_at_tags(ev)
+
+        text = "".join(_plain_texts(ev.get_result().chain))
+        assert "@柴郡" in text and "不在本群" not in text, f"实测 {text!r}"
+
+    async def test_cross_component_merge_gets_same_marker(self, tmp_path):
+        """跨组件拼合路径（T14-B2）与逐组件路径同口径，也带标记。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id=self.SELF,
+            chain=[Plain("[at:436797"), At(qq="999"), Plain("884] 尾巴")],
+        )
+        ev.message_str = "你好"
+        ev.bot.member_list = self._members(self.MEMBER)
+        # 消息里没有数字、工具也没命中：拼合出的 436797884 只能走降级路径
+        await plugin.process_at_tags(ev)
+        chain = ev.get_result().chain
+        text = "".join(_plain_texts(chain))
+        assert f"@{self.STRANGER}（不在本群）" in text, f"实测 {text!r}"
+        assert _ats(chain) == ["999"], f"链内既有 At 必须保留，实测 {_ats(chain)}"
+
+    async def test_multiple_strangers_each_get_own_marker(self, tmp_path):
+        """同一轮多个不可信 ID：各自带标记，且都不渲染 At。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id=self.SELF,
+            chain=[
+                Plain(f"[at:{self.STRANGER}] 与 [at:{self.STRANGER2}] 都叫一下")
+            ],
+        )
+        ev.message_str = "你好"
+        ev.bot.member_list = self._members(self.MEMBER)
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        text = "".join(_plain_texts(chain))
+        assert f"@{self.STRANGER}（不在本群）" in text, f"实测 {text!r}"
+        assert f"@{self.STRANGER2}（不在本群）" in text, f"实测 {text!r}"
+        assert not any(isinstance(c, At) for c in chain)
+
+    async def test_digit_only_nickname_falls_back_to_real_id(
+        self, monkeypatch, tmp_path
+    ):
+        """T38/F3：名片/昵称是**纯数字**时不得当显示名，回落 `@<真实号>`。
+
+        用户复测指出 `@1234567` 会被当成"这个人的 QQ 号"（与"@数字看着像真艾特"
+        同型）。成员真号 3882563785 确在名单内 ⇒ 按方案 C **不加**「（不在本群）」。
+        """
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id=self.SELF,
+            chain=[Plain(f"好的 [at:{self.MEMBER}]")],
+        )
+        ev.message_str = "你好"  # 消息里没有号码，工具也没被调用
+        ev.bot.member_list = [
+            {"user_id": self.MEMBER, "nickname": "1234567", "card": "1234567"}
+        ]
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        text = "".join(_plain_texts(chain))
+        assert f"@{self.MEMBER}" in text, f"应回落为真实号，实测 {text!r}"
+        assert "1234567" not in text, f"纯数字名片不得当显示名，实测 {text!r}"
+        assert "不在本群" not in text, "该号确在名单内，按方案 C 不得带标记"
+        assert not any(isinstance(c, At) for c in chain), "仍不得渲染真 At"
+        assert_n1(chain)
+        assert not audit_file(tmp_path, datetime.now().strftime("%Y%m%d")).exists(), (
+            "降级不写 at_member 审计"
+        )
+        assert any("未经工具确认" in str(w) for w in warnings), warnings
+
+    async def test_trusted_paths_still_render_true_at(self, tmp_path):
+        """工具确认与自目标窄例外不受影响（仍渲染真 At，无标记）。"""
+        plugin = make_plugin(config={"allow_direct_qq_at": True}, audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id=self.SELF, chain=[])
+        ev.message_str = "你好"
+        ev.bot.member_list = self._members(self.MEMBER, self.SELF)
+        await plugin.search_and_mention(ev, f"成员{self.MEMBER}")
+
+        ev.set_chain([Plain(f"[at:{self.MEMBER}] 和 [at:{self.SELF}]")])
+        await plugin.process_at_tags(ev)
+        chain = ev.get_result().chain
+        assert _ats(chain) == [self.MEMBER, self.SELF], f"实测 {_ats(chain)}"
+        assert "不在本群" not in "".join(_plain_texts(chain))
 
 
 class TestStreamingFormRows:
