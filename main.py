@@ -13,6 +13,8 @@ from astrbot.api.message_components import Plain, At, BaseMessageComponent
 from astrbot.core.agent.message import TextPart  # noqa: F401 常规用法，见 P2-6 说明
 
 from .utils import (
+    AT_TAG_HEAD_PATTERN,
+    AT_TAG_LOOSE_PATTERN,
     AT_TAG_PATTERN,
     audit_log_path,
     build_audit_record,
@@ -23,7 +25,9 @@ from .utils import (
     expand_alias_queries,
     format_member_choice_list,
     format_single_member_result,
+    has_at_tag,
     is_at_all_in_cooldown,
+    parse_at_tag_payload,
     split_text_by_at_tags,
 )
 
@@ -45,10 +49,15 @@ _MEMBER_LIST_RETRY_DELAY: float = 0.5  # 重试间隔（秒，P2-7）
 _AUDIT_OP_AT_MEMBER = "at_member"
 _AUDIT_OP_AT_ALL = "at_all"
 
-# P1-2 宽松恢复正则：在"切碎/污染后重新完整暴露"的残留 Plain 文本中
-# 搜索完整 [at:ID]（严格解析 AT_TAG_PATTERN 未能命中的场景），命中则
-# 原位恢复为 At 组件。仅匹配成员标签（不含 [at:all]）。
-_LOOSE_AT_PATTERN = re.compile(r"\[at:(\d+)\]")
+# P0-1 跨组件拼合窗口：标签前缀与闭合 "]" 之间最多累积的字符数，
+# 超出即认为不是被切碎的标签（避免长正文被误吞）。
+_SPLIT_AT_WINDOW: int = 64
+
+# P0-1 跨组件拼合次数上限（每链）：防止病态输入下的反复重建。
+_SPLIT_AT_MAX_ROUNDS: int = 8
+
+# 艾特意图关键词（P0-4 可观测：区分"工具未被调用"与"模型未按提示词调用"）
+_AT_INTENT_PATTERN = re.compile(r"艾特|叫一下|喊一下|呼叫|@|\bat\b", re.IGNORECASE)
 
 
 def _strip_clean_prefix(text: str, n: int) -> str:
@@ -173,9 +182,15 @@ class LLMAtToolPlugin(Star):
         self._at_all_last_trigger: dict[str, float] = {}
         # 会话级多结果待选：key=unified_msg_origin, value=(matches, created_ts)
         self._pending_choices: dict[str, Tuple[list, float]] = {}
-        # 兜底补插缓存（修复 2）：key=unified_msg_origin, value=(user_id, created_ts)
-        # 仅 search_and_mention 唯一命中成员时写入；process_at_tags 消费后即删除
-        self._fallback_at: dict[str, Tuple[str, float]] = {}
+        # 兜底补插缓存（修复 2）：key=unified_msg_origin,
+        # value=(sender_id, user_id, created_ts)——绑定发起者，防止同群
+        # 其它用户的回复被补插他人找到的成员（r2 评审 F1）
+        self._fallback_at: dict[str, Tuple[str, str, float]] = {}
+        # 工具缺席告警去重（P0-4）：key=unified_msg_origin，每会话只告警一次
+        self._tool_absent_warned: set = set()
+        # "艾特意图未被满足"告警去重（r2 评审 F8）：key=unified_msg_origin，
+        # 每会话只记一次；与 _tool_absent_warned 同形，规模受会话数约束
+        self._intent_unmet_warned: set = set()
 
         # 审计目录（获取失败时审计降级跳过，不阻断消息流）
         self._audit_dir: Optional[object] = None
@@ -441,7 +456,13 @@ class LLMAtToolPlugin(Star):
     async def inject_at_instruction(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """在 LLM 请求前注入格式指令和动态配置。"""
+        """在 LLM 请求前注入格式指令和动态配置。
+
+        P0-4：先按 `req.func_tool` 判定艾特工具是否真的进了本轮请求（人设
+        "工具"白名单 / 插件集过滤都可能剔除它）。缺席时注入降级提示并留一次
+        warning，绝不要求模型调用一个不存在的工具（否则模型只能退化成
+        "输出裸标签"或"纯文本假装艾特"）。
+        """
         # P4：请求阶段即安装 send 兜底渲染（实例级、幂等），保证任何第三方
         # 插件在结果阶段"清空 chain 后直接 event.send()"时，[at:ID] 仍在
         # 真正发往平台前被渲染为 At 组件。
@@ -455,21 +476,41 @@ class LLMAtToolPlugin(Star):
             )
             return
 
+        # 工具可达性判定：ToolSet.names() 是宿主装配结果的唯一可读视图
+        func_tool = getattr(req, "func_tool", None)
+        try:
+            tool_names = list(func_tool.names()) if func_tool is not None else []
+        except Exception:
+            tool_names = []
+        umo = event.unified_msg_origin
+        if "search_and_mention" not in tool_names:
+            req.system_prompt = (req.system_prompt or "") + (
+                "\n\n【注意】当前会话未启用艾特工具，你无法搜索群成员，"
+                "也不要输出任何 [at:ID] 或 [at:all] 标签。"
+                "如用户要求艾特某人，请用自然语言说明当前会话未启用艾特工具，"
+                "不要伪造艾特。"
+            )
+            if umo not in self._tool_absent_warned:
+                self._tool_absent_warned.add(umo)
+                logger.warning(
+                    "[AtTool] 本轮请求工具集不含 search_and_mention（会话 "
+                    f"{umo}），已注入降级提示；当前可用工具: {tool_names[:20]}"
+                )
+            return
+
         static_part = self.llm_prompt_base
         dynamic_part = self._build_dynamic_instructions()
         full_instruction = static_part + "\n\n" + dynamic_part
         req.system_prompt = (req.system_prompt or "") + full_instruction
 
-        # 可观测性：群聊中出现艾特意图关键词时记录注入（用于区分
-        # “提示词未注入”与“模型未按提示词调用工具”两类失败）
+        # 可观测性：群聊中出现艾特意图关键词时记录注入，并打标记供
+        # process_at_tags 判定"有意图但工具从未被调用"（反馈 1 取证）
         try:
             msg_text = getattr(event, "message_str", "") or ""
-            if event.get_group_id() and re.search(
-                r"艾特|叫一下|喊一下|呼叫|@|\bat\b", msg_text, re.IGNORECASE
-            ):
+            if event.get_group_id() and _AT_INTENT_PATTERN.search(msg_text):
+                setattr(event, "_attool_at_intent", True)
                 logger.info(
-                    f"[AtTool] 检测到艾特意图，已注入艾特指令（会话 "
-                    f"{event.unified_msg_origin}）"
+                    f"[AtTool] 检测到艾特意图，已注入艾特指令（会话 {umo}）"
                 )
         except Exception:
             pass
@@ -499,12 +540,21 @@ class LLMAtToolPlugin(Star):
     async def search_and_mention(
         self, event: AstrMessageEvent, name: str
     ) -> str:
-        """
-        在群聊中根据昵称或群名片搜索群成员，并返回可以直接使用的艾特标签。
+        """当用户要求艾特、@、呼叫、叫一下或喊一下某个群成员时，必须先调用本工具搜索群成员；本工具返回可直接使用的 [at:ID] 艾特标签。
+
+        使用时机与约束：
+        - 用户表达"艾特/@/呼叫/叫一下/喊一下某人"等意图时，必须先调用本工具，
+          不要用 "@名字" 之类的纯文本假装艾特；
+        - 拿到返回值后在最终回复中原样输出其中的 [at:ID] 标签，本插件会把它
+          渲染成真实艾特，不要改写标签、不要加空格；
+        - 返回多个候选时，必须先把列表展示给用户让其选择序号，再调用
+          select_member_by_index 选定，不要自行猜测；
+        - 未找到成员时如实说明，不要凭昵称猜测 ID 或伪造标签。
 
         Args:
             name(string): 要搜索的群成员昵称或群名片，例如"张三"、"群主"、"管理员"。
         """
+        setattr(event, "_attool_tool_called", True)
         umo = event.unified_msg_origin
         allowed, deny_reason = self._is_session_allowed(event)
         if not allowed:
@@ -589,7 +639,13 @@ class LLMAtToolPlugin(Star):
                 user_id, display_name, role = matches[0]
                 # 修复 2：唯一命中写入兜底缓存；LLM 最终回复缺标签时由
                 # process_at_tags 自动补插 [at:ID]
-                self._fallback_at[umo] = (user_id, time.time())
+                # r2（评审 F1）：缓存绑定本次发起者 sender_id，宿主按事件
+                # 并发，同群他人回复不得被补插本成员
+                self._fallback_at[umo] = (
+                    str(event.get_sender_id() or ""),
+                    user_id,
+                    time.time(),
+                )
                 drop_expired(self._fallback_at, _FALLBACK_AT_TTL, time.time())
                 logger.info(
                     f"[AtTool] search_and_mention 命中: {display_name} ({user_id}，"
@@ -618,12 +674,12 @@ class LLMAtToolPlugin(Star):
     async def select_member_by_index(
         self, event: AstrMessageEvent, index: int
     ) -> str:
-        """
-        在 search_and_mention 工具返回多个候选成员后，按用户选择的序号选定最终要艾特的成员，并返回可直接使用的艾特标签。
+        """在 search_and_mention 工具返回多个候选成员后，按用户选择的序号选定最终要艾特的成员，并返回可直接使用的 [at:ID] 艾特标签；必须在用户给出序号后再调用本工具，不要凭猜测调用。
 
         Args:
             index(int): 用户选择的成员序号，从 1 开始，对应上次搜索返回列表中的编号。
         """
+        setattr(event, "_attool_tool_called", True)
         allowed, deny_reason = self._is_session_allowed(event)
         if not allowed:
             return f"【拒绝】{deny_reason}"
@@ -672,13 +728,22 @@ class LLMAtToolPlugin(Star):
         send 兜底渲染传入待发送消息链），使"清链直发"类第三方插件场景下
         兜底同样生效。
 
+        r2（评审 F1）：缓存绑定发起者（sender_id）——宿主按事件并发处理
+        （同群多人同时说话），只按 UMO 作 key 会让 B 的无标签回复被补插
+        A 刚找到的成员。发起者不一致时直接消费掉缓存并放弃补插。
+
         返回 True 表示已补插（调用方应继续渲染）；False 表示无需/不可补插。
         缓存为一次性消费：无论是否补插，读取后即删除，防止跨轮次误用。
         """
         umo = event.unified_msg_origin
         now = time.time()
         cached = self._fallback_at.get(umo)
-        if not cached or (now - cached[1]) >= _FALLBACK_AT_TTL:
+        if not cached or (now - cached[-1]) >= _FALLBACK_AT_TTL:
+            self._fallback_at.pop(umo, None)
+            return False
+        sender_id, user_id, _ = cached
+        if sender_id != str(event.get_sender_id() or ""):
+            # 同群另一用户的事件：不得替他人补插（缓存一次性消费）
             self._fallback_at.pop(umo, None)
             return False
         # 链中已有其他来源插入的 At 组件时不再兜底（避免重复艾特）
@@ -690,7 +755,6 @@ class LLMAtToolPlugin(Star):
         if not allowed:
             self._fallback_at.pop(umo, None)
             return False
-        user_id = cached[0]
         self._fallback_at.pop(umo, None)
         chain.append(Plain(f"[at:{user_id}]"))
         logger.warning(
@@ -700,31 +764,28 @@ class LLMAtToolPlugin(Star):
 
     @filter.on_decorating_result(priority=-1000)
     async def process_at_tags(self, event: AstrMessageEvent) -> None:
-        """渲染 [at:ID] → At 组件（P4 延迟渲染：最后执行，免疫第三方插件破坏）。
+        """渲染 [at:ID] → At 组件（P4 延迟渲染 + P0-2 唯一补插入口）。
 
-        P4 兼容改造：priority 由 2 改为 -1000，按 AstrBot 钩子排序
-        （star_handler.py: sort(key=lambda h: -h.extras_configs["priority"])）
-        在全部 on_decorating_result 钩子之后执行。[at:ID] 以纯文本形式贯穿
-        所有中间插件（包括重建 chain 的插件，只要其保留 Plain 文本），由本
-        钩子统一最后渲染为 At 组件——任何插件都无法再丢弃。
+        钩子顺序（实测）：本钩子 priority=-1000，早于分段插件的 -1e17 执行
+        （star_handler.py 按 -priority 降序执行）。因此本钩子看到的是**尚未
+        被分段拆分的整条链**：标签在这里渲染、兜底补插也在链尾完成；随后
+        分段插件按 at_strategy=「跟随下段」把它归入最后一段投递。旧注释
+        "本钩子执行时链已空"与实测执行序矛盾，已修正。
 
-        对"清空 result.chain 后直接 event.send()"的插件（如分段插件），
-        本钩子执行时链已空、标签已作为文本发出，由 on_llm_request 阶段安装
-        的 send 兜底渲染（_wrap_event_send → _render_at_tags）在消息真正发往
-        平台前完成渲染，保证艾特不丢失。
+        P0-2：本钩子是"兜底补插 + 缓存消费"的唯一入口（enable_fallback=
+        True）。send / send_streaming 路径只渲染链内已有标签，绝不补插、
+        绝不消费缓存——否则逐段发送时会把 @ 补到第一段、或把后续段里的
+        真实标签当成"重复"剥离（探针场景 2/3/4 实测）。
 
-        P1-1（QA 方案 A）：本钩子是"兜底补插 + 缓存消费"的唯一入口，
-        enable_fallback=True——send 兜底路径绝不补插/消费，避免分段插件
-        逐段 send 时（段1无标签先触发兜底、段2含标签再渲染）同一成员被
-        重复艾特。
+        第三方插件若在本钩子之前清空 chain 后直接 event.send()，本钩子看到
+        空链（走缓存清理分支）；该段消息由 _wrap_event_send 的"链内已有标签
+        渲染"兜底处理。
         """
         result = event.get_result()
         if not result or not result.chain:
-            # 缺陷 2 修复：主钩子链空时同样解除兜底缓存。
-            # 分段插件"清链直发"后本钩子执行时链已空，无法履行兜底补插
-            # 义务；而 send 路径刻意不消费缓存（P1-1 方案 A，保留给主钩子），
-            # 若此处不清理，缓存将残留满 TTL(120s)，新一轮 LLM 回复无标签
-            # 时会误补插上一轮成员（跨轮次误艾特）。故链空时一并解除缓存。
+            # 链空时解除兜底缓存：本钩子无法履行补插义务，而 send 路径刻意
+            # 不消费缓存（P0-2）；若此处不清理，缓存会残留满 TTL(120s)，
+            # 新一轮无标签回复会误补插上一轮成员（跨轮次误艾特）。
             self._fallback_at.pop(event.unified_msg_origin, None)
             return
         rendered, new_chain = await self._render_at_tags(
@@ -732,6 +793,24 @@ class LLMAtToolPlugin(Star):
         )
         if rendered:
             result.chain = new_chain
+
+        # P0-4 可观测（反馈 1）：有艾特意图、工具在本轮可用却从未被调用，
+        # 且最终回复没有任何真实艾特 → 记一条 warning，供 F2 判定取证。
+        # r2（评审 F8）：按会话去重（_AT_INTENT_PATTERN 含 '@' 与 \bat\b，
+        # 触发面宽于"真要艾特"，不去重会在活跃群形成常态噪音）。
+        final_chain = new_chain if rendered else result.chain
+        if (
+            getattr(event, "_attool_at_intent", False)
+            and not getattr(event, "_attool_tool_called", False)
+            and not any(isinstance(comp, At) for comp in final_chain)
+        ):
+            umo = event.unified_msg_origin
+            if umo not in self._intent_unmet_warned:
+                self._intent_unmet_warned.add(umo)
+                logger.warning(
+                    "[AtTool] 艾特意图未被满足：本轮未调用 search_and_mention，"
+                    f"最终回复也无艾特标签（会话 {umo}）"
+                )
 
     # ------------------------------------------------------------------ #
     # P4 公共渲染：主钩子与 send 兜底共用的 [at:ID] → At 渲染流水线
@@ -741,21 +820,24 @@ class LLMAtToolPlugin(Star):
         event: AstrMessageEvent,
         chain: List[BaseMessageComponent],
         enable_fallback: bool = False,
+        keep_unclosed: bool = False,
     ) -> Tuple[bool, List[BaseMessageComponent]]:
         """把消息链中的 [at:ID] / [at:all] 渲染为 At 组件（唯一渲染流水线）。
 
-        process_at_tags 钩子与 send 兜底渲染共用本方法，保证两条路径的
-        会话准入 / @全体权限+冷却 / 审计 / 零宽清理语义完全一致。
+        process_at_tags 钩子与 send / send_streaming 兜底渲染共用本方法，
+        保证各路径的形态归一 / 会话准入 / @全体权限+冷却 / 审计 / 零宽清理
+        语义一致；标签语法解析统一委托 utils（P0-5 单一事实来源）。
 
         Args:
             event: 当前消息事件（会话准入、@全体权限、审计依赖）。
             chain: 待渲染的消息链组件列表（调用方保证非空）。
-            enable_fallback: 是否允许"兜底补插 + 缓存消费"（P1-1，QA 方案
-                A）。仅主钩子 process_at_tags（整链最后渲染）传 True；send
-                兜底路径（_wrap_event_send）保持默认 False，只做"已有标签
-                时的渲染"，绝不补插、绝不消费缓存——否则分段插件逐段 send
-                时：段1无标签触发兜底补插（消费缓存）、段2含标签再渲染一次，
-                同一成员被重复艾特。
+            enable_fallback: 是否允许"兜底补插 + 缓存消费"（P0-2）。仅主钩子
+                process_at_tags 传 True；send / send_streaming 保持默认 False
+                ——否则分段插件逐段发送时会出现"@ 被补到第一段""后续段真实
+                标签被当重复剥离"（探针场景 2/3/4）。
+            keep_unclosed: 未闭合标签语法是否原样保留。流式路径传 True：
+                跨 chunk 拼合属非目标（spec P2），残缺 chunk 原样透传，
+                不删除用户可见正文。
 
         Returns:
             (rendered, new_chain)：rendered=True 表示链已被重建，调用方应
@@ -782,39 +864,64 @@ class LLMAtToolPlugin(Star):
             else:
                 merged_input.append(comp)
 
-        # ② 扫描标签（无标签时走兜底补插，修复 2）
+        # ①b 跨组件拼合（P0-1）："[at:12" 与 "345]" 之间夹着 At 等非 Plain
+        #     组件时，步骤①的相邻合并救不了；先拼回完整标签再统一解析，
+        #     否则前缀会被当成"未闭合语法"删除、艾特丢失（spec §7.2 第 13 行）
+        reassembled = self._merge_split_at_tags(merged_input, umo)
+        if reassembled is not None:
+            merged_input = reassembled
+
+        # ② 扫描标签（P0-5 统一判定入口，替代旧的裸 "[at:" 子串判定）
         has_tag = False
         has_at_all_tag = False
         for comp in merged_input:
-            if isinstance(comp, Plain) and "[at:" in comp.text:
-                has_tag = True
-                if "[at:all]" in comp.text:
-                    has_at_all_tag = True
-        if not has_tag:
-            if not enable_fallback:
-                # P1-1（QA 方案 A）：send 兜底路径不补插、不消费缓存——
-                # 补插与消费必须成对发生在主钩子（整链最后渲染），否则
-                # 分段插件逐段 send 时：段1无标签触发兜底补插（消费缓存）、
-                # 段2含标签再渲染一次，导致同一成员被重复艾特。
-                return False, chain
-            if not self._apply_fallback_at_tag(event, merged_input):
-                return False, chain
+            if not isinstance(comp, Plain) or not has_at_tag(comp.text):
+                continue
             has_tag = True
+            if has_at_all_tag:
+                continue
+            for match in AT_TAG_LOOSE_PATTERN.finditer(comp.text):
+                kind, value = parse_at_tag_payload(match.group(1))
+                if kind == "at" and value == "all":
+                    has_at_all_tag = True
+                    break
+        if not has_tag:
+            if enable_fallback and self._apply_fallback_at_tag(event, merged_input):
+                has_tag = True
+            elif reassembled is None:
+                # 无标签（send 路径不补插 / 主钩子无可补插）：原链原样返回，
+                # 无标签消息零开销透传（P0-2）
+                return False, chain
         elif enable_fallback:
-            # 回复已含标签：本次兜底义务解除，仅主钩子消费清理缓存。
-            # send 路径不消费（保留给主钩子），保证"补插"与"消费"只由
-            # 主钩子成对执行，杜绝跨路径竞争导致的重复/漏补。
+            # 回复已含标签：本次兜底义务解除（仅主钩子消费清理缓存）
             self._fallback_at.pop(umo, None)
 
-        # ③ 会话准入：不允许则统一降级（剥离 [at:ID]，[at:all] 转纯文本）
+        if not has_tag:
+            # 仅发生跨组件拼合（P0-1）：标签已在 ①b 渲染为 At，仍需返回重建链
+            return True, self._finalize_chain(merged_input)
+
+        # ③ 会话准入：不允许则统一按 P0-1 语义降级（成员标签剥离、@全体转
+        #    纯文本、非数字载荷转 @载荷），全程不改写调用方组件（P1-3）
         allowed, _ = self._is_session_allowed(event)
         if not allowed:
             degraded: List[BaseMessageComponent] = []
             for comp in merged_input:
-                if isinstance(comp, Plain):
-                    comp.text = re.sub(r"\[at:\d+\]", "", comp.text)
-                    comp.text = re.sub(r"\[at:all\]", "@全体成员", comp.text)
-                degraded.append(comp)
+                if not isinstance(comp, Plain):
+                    degraded.append(comp)
+                    continue
+                kept: list[str] = []
+                for kind, value in split_text_by_at_tags(comp.text):
+                    if kind == "text":
+                        kept.append(value)
+                    elif kind == "degrade":
+                        logger.warning(
+                            f"会话不允许艾特，标签载荷 {value!r} 已降级为纯文本"
+                        )
+                        kept.append("@" + value)
+                    elif kind == "at" and value == "all":
+                        kept.append("@全体成员")
+                    # 成员标签 / 空载荷 / 未闭合语法：删除标签语法
+                degraded.append(Plain("".join(kept)))
             return True, self._finalize_chain(degraded)
 
         # ④ @全体 权限 + 频率一次性判定（CHG-01 / CHG-03）
@@ -834,33 +941,63 @@ class LLMAtToolPlugin(Star):
                 elif self.at_all_cooldown > 0:
                     self._record_at_all_trigger(event)
 
-        # ⑤ 逐组件解析标签并渲染
+        # ⑤ 逐组件解析标签并渲染（共用 utils 单一解析实现，B2/B5 一并收敛）
         new_chain: List[BaseMessageComponent] = []
         at_member_targets: List[str] = []
         for comp in merged_input:
-            if isinstance(comp, Plain):
-                for kind, value in split_text_by_at_tags(comp.text):
-                    if kind == "text":
-                        if value:
-                            new_chain.append(Plain(value))
-                    elif value == "all":
-                        if at_all_allowed:
-                            new_chain.append(At(qq="all"))
-                        else:
-                            new_chain.append(Plain("@全体成员"))
-                    else:
-                        new_chain.append(At(qq=value))
-                        at_member_targets.append(value)
-            else:
+            if not isinstance(comp, Plain):
                 new_chain.append(comp)
+                continue
+            for kind, value in split_text_by_at_tags(comp.text):
+                if kind == "text":
+                    if value:
+                        new_chain.append(Plain(value))
+                elif kind == "degrade":
+                    # P0-1：非数字/全角/占位符载荷降级为可读纯文本，绝不原样穿链
+                    logger.warning(
+                        f"标签载荷无法解析（{value!r}），已降级为纯文本 "
+                        f"@{value}（会话 {umo}）"
+                    )
+                    new_chain.append(Plain("@" + value))
+                elif kind == "unclosed":
+                    if keep_unclosed:
+                        # 流式 chunk：跨 chunk 拼合为非目标，原样保留语法片段
+                        new_chain.append(Plain(value))
+                        continue
+                    logger.warning(
+                        "检测到未闭合的 [at: 标签语法，已删除语法片段并保留"
+                        f"其余正文（会话 {umo}）"
+                    )
+                elif kind == "drop":
+                    continue
+                elif value == "all":
+                    if at_all_allowed:
+                        new_chain.append(At(qq="all"))
+                    else:
+                        new_chain.append(Plain("@全体成员"))
+                else:
+                    new_chain.append(At(qq=value))
+                    at_member_targets.append(value)
 
-        # ⑥ 审计写入：@单人逐条 + @全体整体一条（CHG-03）
+        # ⑥ 审计写入：@单人逐条（同一事件同一目标只记一次，P1-4）+
+        #    @全体整体一条（CHG-03）
         if self.enable_audit_log:
-            for target_id in at_member_targets:
+            audited = getattr(event, "_attool_audited_targets", None)
+            if not isinstance(audited, set):
+                audited = set()
+                try:
+                    event._attool_audited_targets = audited
+                except Exception:
+                    pass
+            for target_id in dict.fromkeys(at_member_targets):
+                if target_id in audited:
+                    continue
+                audited.add(target_id)
                 self._write_audit_log(
                     event, _AUDIT_OP_AT_MEMBER, target_id, True, "ok"
                 )
-            if has_at_all_tag:
+            if has_at_all_tag and "all" not in audited:
+                audited.add("all")
                 self._write_audit_log(
                     event,
                     _AUDIT_OP_AT_ALL,
@@ -869,149 +1006,120 @@ class LLMAtToolPlugin(Star):
                     at_all_deny_reason or "ok",
                 )
 
-        # ⑦ 收尾（零宽清理/空剔除/相邻合并/At 后补零宽）
+        # ⑦ 收尾（零宽清理/空剔除/相邻合并/At 后补零宽，全程 copy-on-write）
         new_chain = self._finalize_chain(new_chain)
 
-        # ⑦b P1-2 宽松恢复：合并+清洗后仍含 "[at:" 的 Plain，若其中重新
-        #     暴露出完整 [at:ID]（如标签被切碎且混入零宽字符，finalize 清洗
-        #     零宽后标签恢复完整），则原位恢复为 At 组件（每链至多一次）。
-        recovered_chain = self._recover_loose_at_tags(event, new_chain)
-        if recovered_chain is not None:
-            new_chain = recovered_chain
-
-        # ⑦c 残缺标签告警（宽松恢复后仍未消除的 [at: 残留）
+        # ⑦b 最后一道可观测防线：收尾后仍含标签语法的 Plain（正常路径不应
+        #    出现；流式 chunk 的未闭合语法属已知限制，不告警）
         residual = [
             comp.text
             for comp in new_chain
-            if isinstance(comp, Plain) and "[at:" in comp.text
+            if isinstance(comp, Plain) and has_at_tag(comp.text)
         ]
-        if residual:
+        if residual and not keep_unclosed:
             logger.warning(
-                "检测到未闭合的 [at: 标签残留（可能被第三方插件在分段/重建时"
+                "检测到 [at: 标签语法残留（可能被第三方插件在分段/重建时"
                 f"切断），已按纯文本保留: {residual!r}，会话 {umo}"
             )
         return True, new_chain
 
-    def _recover_loose_at_tags(
-        self, event: AstrMessageEvent, chain: List[BaseMessageComponent]
-    ) -> Optional[List[BaseMessageComponent]]:
-        """P1-2 宽松恢复：把切碎/污染后重新完整暴露的 [at:ID] 恢复为 At。
+    def _merge_split_at_tags(
+        self, chain: list[BaseMessageComponent], umo: str
+    ) -> list[BaseMessageComponent] | None:
+        """P0-1 跨组件拼合：把被非 Plain 组件切碎的标签拼回并渲染为 At。
 
-        背景：P4 延迟渲染（priority=-1000）使 [at:ID] 以纯文本穿过所有
-        中间插件；AstrBot 内建 process_buffer（astr_message_event.py 按
-        [^。？！~…]+[。？！~…]+ 切文本流）或分段类第三方插件可能把标签切
-        成碎片（如 [at:12] 与 [345] 分处组件、标签内混入零宽字符/空白），
-        严格正则 AT_TAG_PATTERN 无法命中 → 标签以裸文本发出。
+        链形态如 Plain("…[at:12") + At(999) + Plain("345]…")：两个 Plain 被
+        At 隔开，步骤①的相邻 Plain 合并无法修复，逐组件解析只会把前缀当成
+        未闭合语法删除。此处以起始语法为锚点、跨过中间组件累积后续 Plain
+        文本（零宽透明，窗口 _SPLIT_AT_WINDOW 字符），拼出完整成员标签则
+        原位插入 At 组件，中间组件保持原序不动。
 
-        本方法在渲染收尾处兜底，按两种形态恢复（每链至多恢复一次，防止
-        多次恢复导致组件乱序；命中即记 warning 告警保证可观测）：
-          a) 单组件完整暴露：对合并+清洗后仍含 "[at:" 的 Plain 组件，用
-             宽松正则 _LOOSE_AT_PATTERN 搜索，命中完整 [at:ID] 则在原
-             位置前插入 At(qq=ID) 组件并移除标签文本；
-          b) 跨组件切碎（缺陷 1 修复）：Plain 含 "[at:" 前缀但缺闭合 "]"、
-             后续 Plain 含闭合 "]"（中间可隔 At 等非 Plain 组件）时，跨
-             组件拼合出完整 [at:ID]，从各组件剥离对应片段并在原位插入
-             At(qq=ID)，中间组件保持原序。
-        前后文本均按原序保留，不误删用户文本；零宽字符视为透明（不参与
-        标签内容，At 后补零宽前缀保留给原组件）。
+        仅拼合成员标签（ASCII 数字载荷）：[at:all] 的切碎形态不做猜测，
+        避免绕过步骤④的 @全体 权限/冷却判定。
 
-        返回恢复后的新链；无命中返回 None（调用方保持原链不变）。
+        Args:
+            chain: 已合并相邻 Plain 的消息链。
+            umo: 当前会话标识（仅用于告警日志）。
+
+        Returns:
+            重建后的链；无需拼合时返回 None（调用方保持原链不变）。
         """
-        umo = event.unified_msg_origin
-        for idx, comp in enumerate(chain):
-            if not isinstance(comp, Plain) or "[at:" not in comp.text:
-                continue
-            # 形态 a：单组件内完整 [at:ID]（零宽污染经 finalize 清洗后重新暴露）
-            match = _LOOSE_AT_PATTERN.search(comp.text)
-            if match:
-                target_id = match.group(1)
-                before = comp.text[: match.start()]
-                after = comp.text[match.end() :]
-                logger.warning(
-                    "宽松恢复 [at:%s]：检测到被切碎/污染的艾特标签残留（严格"
-                    "正则未命中），已原位恢复渲染为 At 组件（会话 %s）",
-                    target_id,
-                    umo,
-                )
-                restored: List[BaseMessageComponent] = []
-                if before:
-                    restored.append(Plain(before))
-                restored.append(At(qq=target_id))
-                if after:
-                    restored.append(Plain(after))
-                chain[idx : idx + 1] = restored
-                return chain
-            # 形态 b：跨组件切碎（[at: 前缀与闭合 ] 分处不同 Plain，中间
-            # 隔着 At 等组件，步骤①的相邻 Plain 合并无法修复）
-            recovered = self._recover_cross_component_at_tag(chain, idx, comp)
-            if recovered is not None:
-                target_id, rebuilt = recovered
-                logger.warning(
-                    "宽松恢复 [at:%s]：检测到跨组件切碎的艾特标签残留（严格"
-                    "正则未命中，前缀与闭合括号分处不同组件），已原位恢复"
-                    "渲染为 At 组件（会话 %s）",
-                    target_id,
-                    umo,
-                )
-                return rebuilt
-        return None
+        working = list(chain)
+        recovered = False
+        # 上限 _SPLIT_AT_MAX_ROUNDS 轮：每轮至少消费一个起始语法，避免
+        # 病态输入下的无限重建（P1-1 明确禁止无上限的 while True 补丁）
+        for _ in range(_SPLIT_AT_MAX_ROUNDS):
+            hit: list[BaseMessageComponent] | None = None
+            for idx, comp in enumerate(working):
+                if not isinstance(comp, Plain) or not has_at_tag(comp.text):
+                    continue
+                hit = self._try_merge_split_at_tag(working, idx, umo)
+                if hit is not None:
+                    break
+            if hit is None:
+                break
+            working = hit
+            recovered = True
+        return working if recovered else None
 
-    def _recover_cross_component_at_tag(
-        self,
-        chain: List[BaseMessageComponent],
-        idx: int,
-        comp: Plain,
-    ) -> Optional[Tuple[str, List[BaseMessageComponent]]]:
-        """跨组件拼合恢复（P1-2 缺陷 1 修复）。
+    def _try_merge_split_at_tag(
+        self, chain: list[BaseMessageComponent], idx: int, umo: str
+    ) -> list[BaseMessageComponent] | None:
+        """尝试用 chain[idx] 起的跨组件文本拼出一个完整成员标签（P0-1）。
 
-        链形态如 Plain("…[at:12") + At(999) + Plain("345]…")："[at:" 前缀
-        与闭合 "]" 分处两个 Plain，中间隔着 At 等非 Plain 组件——步骤①的
-        相邻 Plain 合并无法把它们拼到一起（被 At 隔开），单组件宽松正则
-        也因缺闭合 "]" 不命中，标签以裸文本残留。
+        仅处理本组件内不闭合的起始语法（已闭合的完整标签交给逐组件解析），
+        且拼出的载荷必须是 ASCII 数字，否则不消费任何文本（交由逐组件解析
+        按降级/未闭合规则处理）。
 
-        本方法以 comp.text 中每个 "[at:" 位置为起点，跨过中间组件累积
-        后续 Plain 的文本（零宽字符视为透明、不参与标签内容），直到找到
-        闭合 "]"；若拼出完整 [at:\\d+] 标签则重建链：
-          - 当前 Plain 剥离 "[at:" 起的片段（此前文本保留）；
-          - 后续 Plain 按消耗量剥离被标签占用的文本（含 "]"），剩余文本
-            及其开头零宽（At 后补零宽语义）保留；
-          - 在原位置插入 At(qq=ID)，中间组件保持原序不动。
-        成功返回 (target_id, 重建后的链)；所有 "[at:" 起点均无法拼合时返回
-        None（调用方保持原链，由 ⑦c 残缺告警兜底）。
+        Args:
+            chain: 当前消息链。
+            idx: 起始语法所在 Plain 的下标。
+            umo: 当前会话标识（仅用于告警日志）。
+
+        Returns:
+            重建后的链；无法拼合时返回 None。
         """
-        text = comp.text
-        for at_start in (m.start() for m in re.finditer(r"\[at:", text)):
-            partial = text[at_start + 4 :].replace("\u200b", "")
+        text = chain[idx].text
+        for head in AT_TAG_HEAD_PATTERN.finditer(text):
+            partial = text[head.end() :].replace("\u200b", "")
+            if "]" in partial:
+                continue  # 本组件内已闭合：完整标签，交给逐组件解析
             collected = ""
-            consumption: List[Tuple[int, int]] = []  # (组件索引, 消耗的非零宽字符数)
+            consumption: list[tuple[int, int]] = []  # (组件索引, 消耗的非零宽字符数)
+            closed = False
             for j in range(idx + 1, len(chain)):
+                if len(partial) + len(collected) > _SPLIT_AT_WINDOW:
+                    break
                 nxt = chain[j]
                 if not isinstance(nxt, Plain):
-                    # 跨过中间组件（At 等）：其内容不参与标签拼接，原位保留
-                    continue
-                seg = nxt.text
-                seg_clean = seg.replace("\u200b", "")
+                    continue  # 跨过中间组件（At 等）：内容不参与拼合，原位保留
+                seg_clean = nxt.text.replace("\u200b", "")
                 close_pos = seg_clean.find("]")
                 if close_pos == -1:
                     consumption.append((j, len(seg_clean)))
                     collected += seg_clean
                     continue
-                # 找到闭合 "]"：消耗到 "]" 为止（含），按"清洗零宽后"的
-                # 字符数记录，与 _strip_clean_prefix 的语义一致（零宽透明）
+                # 消耗到 "]" 为止（含），按"清洗零宽后"的字符数记录，
+                # 与 _strip_clean_prefix 的语义一致（零宽透明）
                 consumption.append((j, close_pos + 1))
                 collected += seg_clean[: close_pos + 1]
+                closed = True
                 break
-            else:
-                continue  # 后续无 Plain 可提供闭合 "]"（或根本没有后续组件）
-            match = _LOOSE_AT_PATTERN.fullmatch("[at:" + partial + collected)
+            if not closed:
+                continue  # 后续没有 Plain 能提供闭合 "]"（或链尾截断）
+            match = AT_TAG_PATTERN.fullmatch(head.group(0) + partial + collected)
             if match is None:
                 continue
-            target_id = match.group(1)
+            # 复用唯一分类实现（P0-5）：非成员标签（all）与超长载荷（r2/F5）
+            # 一律不拼合，交回逐组件解析按降级/未闭合规则处理
+            kind, target_id = parse_at_tag_payload(match.group(1))
+            if kind != "at" or target_id == "all":
+                continue
             # ——重建链：剥离片段、原位插入 At、中间组件保持原序——
-            rebuilt: List[BaseMessageComponent] = []
-            head = text[:at_start]
-            if head:
-                rebuilt.append(Plain(head))
+            rebuilt: list[BaseMessageComponent] = []
+            head_text = text[: head.start()]
+            if head_text:
+                rebuilt.append(Plain(head_text))
             rebuilt.append(At(qq=target_id))
             consumed_map = dict(consumption)
             for j in range(idx + 1, len(chain)):
@@ -1021,7 +1129,14 @@ class LLMAtToolPlugin(Star):
                         rebuilt.append(Plain(remain))
                 else:
                     rebuilt.append(chain[j])
-            return target_id, rebuilt
+            logger.warning(
+                "宽松恢复 [at:%s]：检测到跨组件切碎的艾特标签残留（严格正则"
+                "未命中，前缀与闭合括号分处不同组件），已原位恢复渲染为 At "
+                "组件（会话 %s）",
+                target_id,
+                umo,
+            )
+            return rebuilt
         return None
 
     def _finalize_chain(
@@ -1030,21 +1145,28 @@ class LLMAtToolPlugin(Star):
         """渲染收尾：零宽字符清理 / 空 Plain 剔除 / 相邻 Plain 合并 / At 后补零宽。
 
         逻辑与原 process_at_tags 收尾一致（含 P2-4 两遍处理，保证零宽不重复）。
-        """
-        for comp in new_chain:
-            if isinstance(comp, Plain):
-                comp.text = comp.text.strip().replace("\u200b", "")
+        P1-3 copy-on-write：入参组件可能被调用方（甚至第三方插件）共享，
+        所有文本改写都在新建的 Plain 上完成，绝不原地改写共享组件。
 
-        new_chain = [
-            comp
-            for comp in new_chain
-            if not (isinstance(comp, Plain) and not comp.text)
-        ]
+        Args:
+            new_chain: 待收尾的消息链。
+
+        Returns:
+            收尾后的新链（Plain 全部为新对象；非 Plain 组件按引用复用）。
+        """
+        cleaned: list[BaseMessageComponent] = []
+        for comp in new_chain:
+            if not isinstance(comp, Plain):
+                cleaned.append(comp)
+                continue
+            text = comp.text.strip().replace("\u200b", "")
+            if text:
+                cleaned.append(Plain(text))
 
         merged: List[BaseMessageComponent] = []
-        for comp in new_chain:
+        for comp in cleaned:
             if isinstance(comp, Plain) and merged and isinstance(merged[-1], Plain):
-                merged[-1].text += comp.text
+                merged[-1] = Plain(merged[-1].text + comp.text)
             else:
                 merged.append(comp)
         new_chain = merged
@@ -1073,7 +1195,7 @@ class LLMAtToolPlugin(Star):
         for at_idx, zwsp in reversed(insert_after):
             new_chain.insert(at_idx + 1, zwsp)
         for plain_idx in plain_to_prefix:
-            new_chain[plain_idx].text = "\u200b" + new_chain[plain_idx].text
+            new_chain[plain_idx] = Plain("\u200b" + new_chain[plain_idx].text)
 
         return new_chain
 
@@ -1083,24 +1205,35 @@ class LLMAtToolPlugin(Star):
     def _wrap_event_send(self, event: AstrMessageEvent) -> None:
         """给当前事件实例的 send / send_streaming 绑定"发送前最后渲染"兜底。
 
-        第三方插件（如分段插件）可能在 on_decorating_result 钩子内
-        result.chain.clear() 后直接 event.send() 纯文本段；流式输出则由
-        respond.stage 直接调 event.send_streaming() 交付平台适配器。两条
-        路径下 [at:ID] 都可能仍是纯文本，延迟渲染钩子（priority=-1000）
-        已无法兜底，本包装器在消息真正发往平台前完成渲染。
+        (a) 覆盖范围：本包装器只覆盖 `event.send()` 与
+        `event.send_streaming()` 两条交付入口——清空 result.chain 后直接
+        `event.send()` 的第三方插件、以及 respond.stage 直接调
+        `event.send_streaming()` 的流式路径，都从这里过一遍，在消息真正发往
+        平台前把链内已有标签渲染成 At 组件。
+
+        (b) 覆盖不到、也不该依赖的路径：分段插件（astrbot_plugin_splitter）
+        的**非末段**走 `context.send_message()` 直发平台
+        （splitter/main.py:296-322 → context.py 直连 platform.send_by_session），
+        **不经过任何 event.send 包装**。因此"分段后艾特不丢"的正确性并不靠
+        本包装器，而是靠钩子顺序：AtTool 的 on_decorating_result 优先级
+        -1000 高于 splitter 的 -1e17，按 `star_handler.py:22-26` 的
+        `sort(key=lambda h: -h.extras_configs["priority"])` 降序执行 ⇒ 标签在
+        分段之前就已渲染为 At 组件，splitter 只是把 At 按 at_strategy 归段。
+        本包装器是"钩子看不到的链"的补充防线，不是分段场景的依赖。
 
         实例级绑定：仅影响当前事件对象，随事件生命周期结束自动失效，无
         全局副作用、热重载无需恢复。幂等：重复调用只包装一次。
 
         ⚠️需确认：AstrBot 无官方"发送前"事件钩子（on_decorating_result
         为唯一发送前扩展点，OnAfterMessageSentEvent 在发送后），故采用
-        实例方法包装实现最终阶段渲染；包装仅处理含 "[at:" 的消息或存在
-        兜底缓存的事件，其余消息零开销原样透传。
+        实例方法包装实现最终阶段渲染；包装仅处理含标签语法的消息，其余
+        消息零开销原样透传。
 
-        2026-09-07 增强（分段清链丢艾特修复）：分段插件清空 result.chain
-        直发各段时主钩子链空无法兜底，若模型漏写 [at:ID] 标签则艾特全丢。
-        现 send / send_streaming 路径也会执行兜底补插（事件级一次性），
-        并用 event._attool_send_at_done 标记防止跨段重复艾特。
+        P0-2 收敛（2026-09-07 的"send 路径兜底补插 + 跨段剥离"已移除）：
+        本包装器只做"链内已有标签 → At 渲染"（enable_fallback=False）。
+        补插与兜底缓存消费只发生在主钩子 process_at_tags（实测早于
+        splitter 的 -1e17 执行、看到完整链）；send 路径插手只会把 @ 补到
+        第一段、或把后续段里的真实标签当"重复"剥离（探针场景 2/3/4）。
         """
         if getattr(event, "_attool_send_wrapped", False):
             return
@@ -1108,59 +1241,64 @@ class LLMAtToolPlugin(Star):
         if original_send is None:
             return
 
-        async def _render_message(message: Any) -> Tuple[Any, bool]:
-            """渲染含 [at:] 的消息；返回 (最终消息, 是否发生了替换)。
+        async def _render_message(
+            message: Any, keep_unclosed: bool = False
+        ) -> Tuple[Any, bool]:
+            """渲染含标签语法的消息；返回 (最终消息, 是否发生了替换)。
 
-            发送路径兜底补插：分段插件清空 result.chain 后直发各段时，
-            主钩子（priority=-1000）执行时链已空、无法履行兜底补插义务；
-            若模型最终回复又漏写 [at:ID] 标签，艾特将完全丢失（09-07
-            实测复现：工具命中但无审计记录）。本方法在消息真正发往平台前
-            补插一次，并用事件级标记防重复：
-            - 本事件尚未送出艾特、兜底缓存存在且本段无标签 → 补插一次；
-            - 本事件已送出艾特（补插或先前段渲染）→ 后续段的 [at:] 标签
-              剥离为纯文本，杜绝跨段重复艾特。
+            P0-2 收敛：只做"链内已有标签 → At 渲染"（enable_fallback=
+            False），不补插、不消费兜底缓存、不剥离其它段的标签——补插与
+            缓存消费只由主钩子 process_at_tags 承担，否则分段插件逐段发送
+            时 @ 会被补到第一段、后续段的真实标签会被当"重复"剥离。
+
+            Args:
+                message: 待发送的消息（MessageChain 或 str）。
+                keep_unclosed: 流式 chunk 场景传 True，未闭合标签语法原样
+                    保留（跨 chunk 拼合为非目标，不误删用户可见正文）。
+
+            Returns:
+                (最终消息, 是否发生了替换)：未渲染且无字面 \\n 兜底改写时
+                返回原消息 + False，保证无标签消息零开销透传。
             """
             chain = getattr(message, "chain", None)
             is_str = isinstance(message, str)
-            if is_str and "[at:" in message:
+            if is_str and has_at_tag(message):
                 chain = [Plain(message)]
             if not isinstance(chain, list):
                 return message, False
             # 字面 \n 兜底（2026-08-11）：LLM 偶发把换行转义序列（\n）
             # 当字面文本输出，分段插件只认真实换行切不动、发送管道不
             # 转义，导致明文 \n 暴露在群里。发送前统一转真实换行
-            # （角色卡换行规范已治本，此为防御兜底）。
+            # （角色卡换行规范已治本，此为防御兜底）。P1-3：改写发生在
+            # 新建的 Plain 上，不动调用方共享组件。
             # 快速路径：仅含反斜杠的 Plain 才处理，其余零开销。
-            for comp in chain:
-                if isinstance(comp, Plain) and "\\n" in comp.text:
-                    comp.text = (
+            needs_newline_fix = any(
+                isinstance(comp, Plain) and "\\n" in comp.text for comp in chain
+            )
+            if needs_newline_fix:
+                chain = [
+                    Plain(
                         comp.text.replace("\\r\\n", "\n")
                         .replace("\\r", "\n")
                         .replace("\\n", "\n")
                     )
-            has_tag = any(
-                isinstance(comp, Plain) and "[at:" in comp.text for comp in chain
+                    if isinstance(comp, Plain)
+                    else comp
+                    for comp in chain
+                ]
+            if not any(
+                isinstance(comp, Plain) and has_at_tag(comp.text) for comp in chain
+            ):
+                if not needs_newline_fix:
+                    return message, False
+                # 仅做了字面 \n 规范化：链需要替换，但没有标签渲染
+                message.chain = chain
+                return message, True
+            rendered, new_chain = await self._render_at_tags(
+                event, chain, keep_unclosed=keep_unclosed
             )
-            if not has_tag:
-                # 发送路径兜底补插（事件级一次性）：分段直发 + 模型漏写
-                # 标签时保证艾特不丢；复用 _apply_fallback_at_tag 的缓存/
-                # 会话准入/去重语义
-                if (
-                    not getattr(event, "_attool_send_at_done", False)
-                    and self._apply_fallback_at_tag(event, chain)
-                ):
-                    setattr(event, "_attool_send_at_done", True)
-            elif getattr(event, "_attool_send_at_done", False):
-                # 本事件已送出过成员艾特，后续段的 [at:ID] 剥离为纯文本，
-                # 避免跨段重复艾特；[at:all] 不属于兜底范围，仍交给
-                # _render_at_tags 走权限/冷却判定
-                for comp in chain:
-                    if isinstance(comp, Plain):
-                        comp.text = _LOOSE_AT_PATTERN.sub("", comp.text)
-            rendered, new_chain = await self._render_at_tags(event, chain)
             if not rendered:
                 return message, False
-            setattr(event, "_attool_send_at_done", True)
             if is_str:
                 try:
                     from astrbot.core.message.message_event_result import (
@@ -1193,13 +1331,17 @@ class LLMAtToolPlugin(Star):
 
                 流式响应由 respond.stage 直接调 event.send_streaming() 交付
                 平台适配器，绕过 event.send 包装器；若 [at:ID] 恰好整体落在
-                某一段内，在此处补渲染，保证引用回复/分段场景下艾特不丢失。
+                某一段内，在此处渲染，保证引用回复/分段场景下艾特不丢失。
+                跨 chunk 拼合属非目标（spec §7.2 第 18 行）：chunk 内的残缺
+                标签语法原样透传（keep_unclosed=True），不误删正文。
                 """
 
                 async def render_gen() -> Any:
                     async for item in generator:
                         try:
-                            rendered_message, _ = await _render_message(item)
+                            rendered_message, _ = await _render_message(
+                                item, keep_unclosed=True
+                            )
                         except Exception as exc:
                             # 兜底渲染失败绝不影响消息发出
                             logger.error(
@@ -1223,4 +1365,6 @@ class LLMAtToolPlugin(Star):
         self._at_all_last_trigger.clear()
         self._pending_choices.clear()
         self._fallback_at.clear()
+        self._tool_absent_warned.clear()
+        self._intent_unmet_warned.clear()
         logger.info("LLMAtToolPlugin 已清理权限/成员/冷却/待选/兜底缓存并卸载。")

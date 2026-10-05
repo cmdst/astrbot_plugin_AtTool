@@ -17,12 +17,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 import time
 import types
 from pathlib import Path
 
+import docstring_parser
 import pytest
 
 pytestmark = pytest.mark.asyncio
@@ -100,14 +102,39 @@ def _install_astrbot_stub() -> None:
         def __init__(self):
             self.system_prompt = ""
             self.extra_user_content_parts = []
+            # P0-4：真机 ProviderRequest.func_tool 默认 None，由宿主装配；
+            # 这里与真机字段一致，测试用 make_request() 显式注入工具集。
+            self.func_tool = None
 
     class Plain:
+        """最小 Plain 桩：与真机 `Plain.toDict()` 同形（r2 评审 F3）。"""
+
         def __init__(self, text=""):
             self.text = text
 
+        def toDict(self):
+            return {"type": "text", "data": {"text": self.text}}
+
     class At:
-        def __init__(self, qq=""):
+        """最小 At 桩：复刻真机 pydantic `qq: int | str` 强转与 toDict（F3）。
+
+        真机语义（astrbot/core/message/components.py:410-421，实测）：
+        `At(qq="123").qq == 123`（可整数化的串被归一为 int，
+        `"0123"`/`"+123"`/`" 123"` 同样归一）、`At(qq="１２３").qq == 123`
+        （全角数字 → toDict 变成 ASCII "123"，即艾特到错误的人）；
+        非数字串（`"柴郡"`/`"all"`/`""`）保持 str。toDict 恒为 str(qq)。
+        """
+
+        def __init__(self, qq="", name=""):
+            try:
+                qq = int(qq)  # 复刻 pydantic int|str：可整数化则归一为 int
+            except (TypeError, ValueError):
+                qq = str(qq)
             self.qq = qq
+            self.name = name
+
+        def toDict(self):
+            return {"type": "at", "data": {"qq": str(self.qq)}}
 
     class BaseMessageComponent:
         pass
@@ -323,9 +350,67 @@ def audit_file(audit_dir, date_str):
     return Path(audit_dir) / "audit" / f"at_audit_{date_str}.jsonl"
 
 
+class _FakeToolSet:
+    """最小 ToolSet 桩：只需 names()（P0-4 判定工具是否进了本轮请求）。"""
+
+    def __init__(self, names):
+        self._names = list(names)
+
+    def names(self):
+        return list(self._names)
+
+
+def make_request(tool_names=("search_and_mention", "select_member_by_index")):
+    """构造 ProviderRequest；tool_names=None 模拟工具未进本轮请求（P0-4）。
+
+    Args:
+        tool_names: 本轮请求可见的工具名；None/空表示工具集为空。
+
+    Returns:
+        带 system_prompt / extra_user_content_parts / func_tool 的请求对象。
+    """
+    from astrbot.api.provider import ProviderRequest
+
+    req = ProviderRequest()
+    req.func_tool = _FakeToolSet(tool_names) if tool_names else None
+    return req
+
+
 # --------------------------------------------------------------------------- #
 # CHG-01 越权回归（P0 核心）
 # --------------------------------------------------------------------------- #
+class TestStubFidelity:
+    """F3（r2）：测试桩必须与真机组件序列化语义同形，否则维护级防线失真。
+
+    维护级套件全部跑在自造桩上；若桩不实现 `toDict()`、不复刻真机 pydantic
+    `qq: int | str` 的整数归一，"对象层通过、序列化层变形"的回归就无人能咬。
+    本用例把桩与真机（astrbot 4.28.2 实测）的对应关系钉死。
+    """
+
+    async def test_at_toDict_and_coercion_mirror_real_host(self):
+        from astrbot.api.message_components import At
+
+        assert At(qq="123").qq == 123
+        assert isinstance(At(qq="123").qq, int)
+        # 全角数字/前导零/带符号串在真机都被 int() 归一（→ toDict 变 ASCII）
+        assert At(qq="１２３").qq == 123
+        assert At(qq="0123").qq == 123
+        assert At(qq=123).qq == 123
+        # 非数字串保持 str（"all" 与名字载荷）
+        assert At(qq="柴郡").qq == "柴郡"
+        assert At(qq="all").qq == "all"
+        assert At(qq="").qq == ""
+        # 序列化形态恒为 str(qq)
+        assert At(qq="１２３").toDict() == {"type": "at", "data": {"qq": "123"}}
+        assert At(qq="10001").toDict() == {"type": "at", "data": {"qq": "10001"}}
+        assert At(qq="all").toDict() == {"type": "at", "data": {"qq": "all"}}
+
+    async def test_plain_toDict_mirrors_real_host(self):
+        from astrbot.api.message_components import Plain
+
+        assert Plain("文本").toDict() == {"type": "text", "data": {"text": "文本"}}
+
+
 class TestPermissionCacheIsolation:
     """同群不同用户权限缓存互相独立：管理员放行后普通成员仍被拒。"""
 
@@ -555,6 +640,27 @@ class TestSessionAllowRenderIntegration:
         await plugin.process_at_tags(ev)
         chain = ev.get_result().chain
         assert not any(isinstance(c, At) for c in chain)
+
+    async def test_blacklist_strips_case_variant_tag(self, tmp_path):
+        """P1-2：禁艾特会话下大写/全角/非数字形态一并降级（不再残留裸标签）。"""
+        from astrbot.api.message_components import At, Plain
+
+        plugin = make_plugin(
+            config={"session_blacklist": ["1000"]}, audit_dir=tmp_path
+        )
+        ev = FakeEvent(
+            group_id="1000",
+            sender_id="10001",
+            chain=[Plain("看[At:123]和[at：456]和[at:柴郡]")],
+        )
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain)
+        joined = "".join(c.text for c in chain if isinstance(c, Plain))
+        assert "看" in joined and "和" in joined
+        assert "@柴郡" in joined
+        assert "[at:" not in joined.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -793,13 +899,19 @@ class TestCacheLimit:
         plugin._member_cache["g"] = ([], time.time())
         plugin._at_all_last_trigger["g"] = time.time()
         plugin._pending_choices["umo"] = ([], time.time())
-        plugin._fallback_at["umo"] = ("1", time.time())
+        plugin._fallback_at["umo"] = ("10001", "1", time.time())
+        plugin._tool_absent_warned.add("umo")
+        plugin._intent_unmet_warned.add("umo")
         await plugin.terminate()
         assert not plugin._permission_cache
         assert not plugin._member_cache
         assert not plugin._at_all_last_trigger
         assert not plugin._pending_choices
         assert not plugin._fallback_at
+        assert not plugin._tool_absent_warned
+        assert not plugin._intent_unmet_warned, (
+            "F8 新增的意图告警去重集合也必须在卸载时清空（与 _tool_absent_warned 同形）"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -807,12 +919,10 @@ class TestCacheLimit:
 # --------------------------------------------------------------------------- #
 class TestInjectInstruction:
     async def test_inject_allowed_permission_text(self, tmp_path):
-        from astrbot.api.provider import ProviderRequest
-
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001")
         ev.bot.member_info_role = "owner"
-        req = ProviderRequest()
+        req = make_request()
         await plugin.inject_at_instruction(ev, req)
         # 权限提示注入到 extra_user_content_parts（temp 分区），而非 system_prompt
         assert any("具备@全体权限" in p.text for p in req.extra_user_content_parts)
@@ -821,25 +931,66 @@ class TestInjectInstruction:
         )
 
     async def test_inject_denied_permission_text(self, tmp_path):
-        from astrbot.api.provider import ProviderRequest
-
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001")
         ev.bot.member_info_role = "member"
-        req = ProviderRequest()
+        req = make_request()
         await plugin.inject_at_instruction(ev, req)
         assert any("不具备@全体权限" in p.text for p in req.extra_user_content_parts)
 
     async def test_inject_blacklist_denied(self, tmp_path):
-        from astrbot.api.provider import ProviderRequest
-
         plugin = make_plugin(
             config={"session_blacklist": ["1000"]}, audit_dir=tmp_path
         )
         ev = FakeEvent(group_id="1000", sender_id="10001")
-        req = ProviderRequest()
+        req = make_request()
         await plugin.inject_at_instruction(ev, req)
         assert "不允许使用艾特功能" in req.system_prompt
+
+    # ------------------------------------------------------------------ #
+    # P0-4 工具缺席降级 + 一次性告警（反馈 1 诱因：要求调用不存在的工具）
+    # ------------------------------------------------------------------ #
+    async def test_prompt_unchanged_when_tool_present(self, tmp_path):
+        """工具在本轮请求里：提示词与既有行为逐字一致。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.bot.member_info_role = "owner"
+        req = make_request()
+        await plugin.inject_at_instruction(ev, req)
+
+        expected = plugin.llm_prompt_base + "\n\n" + plugin._build_dynamic_instructions()
+        assert req.system_prompt == expected
+        assert "未启用艾特工具" not in req.system_prompt
+
+    async def test_prompt_degrades_when_tool_absent(self, tmp_path):
+        """工具缺席（人设白名单剔除）：不得要求调用不存在的工具、禁止输出标签。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        req = make_request(tool_names=("browse_web",))
+        await plugin.inject_at_instruction(ev, req)
+
+        assert "必须调用" not in req.system_prompt, "缺席时不得要求调用不存在的工具"
+        assert "search_and_mention" not in req.system_prompt
+        assert "未启用艾特工具" in req.system_prompt
+        assert "[at:ID]" in req.system_prompt and "[at:all]" in req.system_prompt
+        assert not req.extra_user_content_parts, "缺席时不注入 @全体权限提示"
+
+    async def test_tool_absent_warning_only_once(self, monkeypatch, tmp_path):
+        """工具缺席告警每会话只记一次（不刷屏），且含可用工具名。"""
+        warnings = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        req = make_request(tool_names=("browse_web", "search_memes"))
+        for _ in range(3):
+            await plugin.inject_at_instruction(ev, req)
+
+        absent = [w for w in warnings if "search_and_mention" in str(w)]
+        assert len(absent) == 1, warnings
+        assert "browse_web" in str(absent[0]), "告警需含可用工具名"
 
 
 # --------------------------------------------------------------------------- #
@@ -1175,7 +1326,7 @@ class TestFallbackAtTag:
         await plugin.process_at_tags(ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
-        assert len(ats) == 1 and ats[0].qq == "1"
+        assert len(ats) == 1 and str(ats[0].qq) == "1"
         # 缓存已被一次性消费
         assert ev.unified_msg_origin not in plugin._fallback_at
 
@@ -1191,7 +1342,7 @@ class TestFallbackAtTag:
         await plugin.process_at_tags(ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
-        assert len(ats) == 1 and ats[0].qq == "1"
+        assert len(ats) == 1 and str(ats[0].qq) == "1"
 
     async def test_cache_consumed_after_tag_present(self, tmp_path):
         from astrbot.api.message_components import Plain, At
@@ -1279,11 +1430,58 @@ class TestFallbackAtTag:
         await plugin.search_and_mention(ev, "张三")
         # 手工过期（TTL=120s）
         val = plugin._fallback_at[ev.unified_msg_origin]
-        plugin._fallback_at[ev.unified_msg_origin] = (val[0], time.time() - 121)
+        plugin._fallback_at[ev.unified_msg_origin] = (
+            val[0],
+            val[1],
+            time.time() - 121,
+        )
 
         ev.set_chain([Plain("过期后的回复")])
         await plugin.process_at_tags(ev)
         assert not any(isinstance(c, At) for c in ev.get_result().chain)
+
+    async def test_fallback_not_injected_for_other_sender_same_umo(self, tmp_path):
+        """F1（r2）：同群另一用户的回复不得被补插他人找的成员。
+
+        兜底缓存按 UMO（群维度）作 key，而宿主按事件并发（同群多人同时
+        说话）→ 只比群不等同于同一轮对话：A 的工具命中写入后，B 的无标签
+        回复会被补插 At(A 找的成员)，被艾特人与 B 的对话无关。
+        """
+        from astrbot.api.message_components import At, Plain
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev_a = self._single_member_event()  # sender=10001
+        await plugin.search_and_mention(ev_a, "张三")  # 唯一命中 → 写缓存
+        assert ev_a.unified_msg_origin in plugin._fallback_at
+
+        ev_b = FakeEvent(group_id="1000", sender_id="20002")  # 同 UMO、不同 sender
+        assert ev_b.unified_msg_origin == ev_a.unified_msg_origin
+        ev_b.set_chain([Plain("今天天气不错～")])
+        await plugin.process_at_tags(ev_b)
+
+        chain = ev_b.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), (
+            "同群他人回复不得被补插 A 找到的成员"
+        )
+        assert ev_b.unified_msg_origin not in plugin._fallback_at, (
+            "错配缓存必须一次性消费掉，避免后续轮次再误插"
+        )
+
+    async def test_fallback_injected_for_same_sender_same_umo(self, tmp_path):
+        """F1 对照：同一发起者的无标签回复仍照常补插（不得误伤原有能力）。"""
+        from astrbot.api.message_components import At, Plain
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = self._single_member_event()
+        await plugin.search_and_mention(ev, "张三")
+
+        # 同一 UMO + 同一 sender（宿主同事件后续渲染）
+        ev_same = FakeEvent(group_id="1000", sender_id="10001")
+        ev_same.set_chain([Plain("好的，这就把张三喊出来～")])
+        await plugin.process_at_tags(ev_same)
+
+        ats = [c for c in ev_same.get_result().chain if isinstance(c, At)]
+        assert len(ats) == 1 and str(ats[0].qq) == "1"
 
     async def test_blacklist_no_fallback(self, tmp_path):
         from astrbot.api.message_components import Plain, At
@@ -1293,7 +1491,11 @@ class TestFallbackAtTag:
         )
         ev = FakeEvent(group_id="1000", sender_id="10001")
         # 手工注入缓存（模拟搜索成功但会话随后被拉黑/不允许）
-        plugin._fallback_at[ev.unified_msg_origin] = ("1", time.time())
+        plugin._fallback_at[ev.unified_msg_origin] = (
+            "10001",
+            "1",
+            time.time(),
+        )
         ev.set_chain([Plain("黑名单会话回复")])
         await plugin.process_at_tags(ev)
         chain = ev.get_result().chain
@@ -1305,13 +1507,17 @@ class TestFallbackAtTag:
 
         plugin = make_plugin(audit_dir=tmp_path)
         ev = FakeEvent(group_id="1000", sender_id="10001")
-        plugin._fallback_at[ev.unified_msg_origin] = ("1", time.time())
+        plugin._fallback_at[ev.unified_msg_origin] = (
+            "10001",
+            "1",
+            time.time(),
+        )
         # 其他来源已插入 At 组件 → 不再兜底追加，避免重复艾特
         ev.set_chain([At(qq="999"), Plain("已有艾特")])
         await plugin.process_at_tags(ev)
         chain = ev.get_result().chain
         ats = [c for c in chain if isinstance(c, At)]
-        assert len(ats) == 1 and ats[0].qq == "999"
+        assert len(ats) == 1 and str(ats[0].qq) == "999"
 
     async def test_fallback_tag_goes_through_audit(self, tmp_path):
         from astrbot.api.message_components import Plain, At
@@ -1386,3 +1592,152 @@ class TestAliasSearch:
         ]
         text = await plugin.search_and_mention(ev, "才俊")
         assert "未找到" in text
+
+
+# --------------------------------------------------------------------------- #
+# P0-3 工具描述触发语义（反馈 1 描述层）+ P0-4 工具调用可观测性
+# --------------------------------------------------------------------------- #
+class TestToolSchemaSemantics:
+    """工具描述必须给出"何时必须调用"，参数 schema 与工具名冻结不变。"""
+
+    async def test_search_and_mention_docstring_trigger_semantics(self):
+        src = inspect.getsource(LLMAtToolPlugin.search_and_mention)
+        assert '@filter.llm_tool(name="search_and_mention")' in src, "工具名冻结"
+
+        doc = docstring_parser.parse(
+            LLMAtToolPlugin.search_and_mention.__doc__ or ""
+        )
+        description = doc.description or ""
+        for keyword in ("艾特", "@", "呼叫", "必须"):
+            assert keyword in description, (keyword, description)
+        assert "[at:ID]" in description
+
+    async def test_select_member_by_index_docstring_trigger_semantics(self):
+        src = inspect.getsource(LLMAtToolPlugin.select_member_by_index)
+        assert '@filter.llm_tool(name="select_member_by_index")' in src, "工具名冻结"
+
+        doc = docstring_parser.parse(
+            LLMAtToolPlugin.select_member_by_index.__doc__ or ""
+        )
+        description = doc.description or ""
+        for keyword in ("序号", "必须", "search_and_mention"):
+            assert keyword in description, (keyword, description)
+
+    async def test_tool_schema_parameters_unchanged(self):
+        """docstring_parser 解析出的参数名/类型与现状一致（宿主 schema 契约）。"""
+        search_doc = docstring_parser.parse(
+            LLMAtToolPlugin.search_and_mention.__doc__ or ""
+        )
+        assert [
+            (p.arg_name, p.type_name) for p in search_doc.params
+        ] == [("name", "string")]
+        assert search_doc.params[0].description
+
+        select_doc = docstring_parser.parse(
+            LLMAtToolPlugin.select_member_by_index.__doc__ or ""
+        )
+        assert [
+            (p.arg_name, p.type_name) for p in select_doc.params
+        ] == [("index", "int")]
+        assert select_doc.params[0].description
+
+
+class TestToolCallObservability:
+    """P0-4：区分"工具未被调用"与"工具被调用但回复无标签"两类失败（复用 logger）。"""
+
+    @staticmethod
+    def _intent_event():
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.message_str = "帮我艾特一下张三"
+        return ev
+
+    async def test_warns_when_intent_but_tool_not_called(
+        self, monkeypatch, tmp_path
+    ):
+        """有艾特意图 + 工具可用但未调用 + 回复无艾特 → warning。"""
+        from astrbot.api.message_components import Plain
+
+        warnings = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = self._intent_event()
+        await plugin.inject_at_instruction(ev, make_request())
+
+        ev.set_chain([Plain("好的，@张三 你来说两句")])  # 纯文本假装艾特
+        await plugin.process_at_tags(ev)
+
+        assert any("未调用 search_and_mention" in str(w) for w in warnings), warnings
+
+    async def test_intent_unmet_warning_deduped_per_umo(
+        self, monkeypatch, tmp_path
+    ):
+        """F8（r2）：同一会话只记一次，避免活跃群常态噪音。"""
+        from astrbot.api.message_components import Plain
+
+        warnings = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        for _ in range(3):
+            ev = self._intent_event()  # 同一群 + 同一 sender → 同一 UMO
+            await plugin.inject_at_instruction(ev, make_request())
+            ev.set_chain([Plain("好的")])
+            await plugin.process_at_tags(ev)
+
+        hits = [w for w in warnings if "未调用 search_and_mention" in str(w)]
+        assert len(hits) == 1, f"每会话只应记一次，实际 {len(hits)} 次"
+
+        # 另一会话仍可各记一次（去重按 UMO 而非全局）
+        ev2 = FakeEvent(group_id="2000", sender_id="10001")
+        ev2.message_str = "帮我艾特一下李四"
+        await plugin.inject_at_instruction(ev2, make_request())
+        ev2.set_chain([Plain("好的")])
+        await plugin.process_at_tags(ev2)
+        hits2 = [w for w in warnings if "未调用 search_and_mention" in str(w)]
+        assert len(hits2) == 2
+
+    async def test_no_warn_when_tool_called(self, monkeypatch, tmp_path):
+        """工具被调用后不再产生"未调用"告警（避免误报）。"""
+        from astrbot.api.message_components import Plain
+
+        warnings = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = self._intent_event()
+        ev.bot.member_list = [
+            {"user_id": "1", "nickname": "张三", "card": "", "role": "member"}
+        ]
+        await plugin.inject_at_instruction(ev, make_request())
+        await plugin.search_and_mention(ev, "张三")
+
+        ev.set_chain([Plain("好的[at:1]")])
+        await plugin.process_at_tags(ev)
+
+        assert not any("未调用 search_and_mention" in str(w) for w in warnings)
+
+    async def test_no_warn_without_intent(self, monkeypatch, tmp_path):
+        """无艾特意图时不告警（意图关键词误报治理）。"""
+        from astrbot.api.message_components import Plain
+
+        warnings = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(group_id="1000", sender_id="10001")
+        ev.message_str = "今天天气不错"
+        await plugin.inject_at_instruction(ev, make_request())
+
+        ev.set_chain([Plain("是呀")])
+        await plugin.process_at_tags(ev)
+
+        assert not any("未调用 search_and_mention" in str(w) for w in warnings)

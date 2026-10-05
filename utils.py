@@ -10,6 +10,7 @@
 - CHG-06 成员角色中文标注
 - CHG-07 缓存过期清理与大小上限淘汰
 - CHG-08 [at:xxx] 标签文本解析
+- P0-5 标签语法单一事实来源（形态判定 / 载荷分类 / 拆分共用同一份正则）
 
 缓存统一约定：缓存 value 的最后一个元素为创建时间戳（float），
 过期判定为 `now - value[-1] >= ttl`，这样三种缓存（权限/成员/待选）
@@ -23,13 +24,17 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 __all__ = [
+    "AT_TAG_HEAD_PATTERN",
+    "AT_TAG_LOOSE_PATTERN",
     "AT_TAG_PATTERN",
     "ROLE_LABELS",
     "format_role_label",
     "match_session_entry",
     "check_session_lists",
     "build_permission_cache_key",
+    "has_at_tag",
     "is_at_all_in_cooldown",
+    "parse_at_tag_payload",
     "split_text_by_at_tags",
     "format_single_member_result",
     "format_member_choice_list",
@@ -47,8 +52,86 @@ ROLE_LABELS = {
     "member": "成员",
 }
 
-# @ 标签正则：匹配 [at:数字] 或 [at:all]。作为标签解析的单一事实来源。
-AT_TAG_PATTERN = re.compile(r"\[at:(\d+|all)\]")
+# --------------------------------------------------------------------------- #
+# @ 标签语法（P0-1 / P0-5 单一事实来源）
+#
+# 宿主序列化（[At:{qq}] / [At:全体成员]）与历史上下文（[At: 名字]）会诱导模型
+# 写出多种标签形态：大小写（[At:123]）、冒号两侧空白/零宽（[at: 123]、
+# [at\u200b:123]）、全角冒号（[at：123]）、载荷内零宽（[at:12\u200b3]）、
+# "[" 与 at 之间夹零宽（[\u200bat:123]，r2 评审 F4）、非数字载荷（[at:柴郡]）。
+# 下列正则由同一份片段拼接而成，渲染、降级、判定三处共用，避免多套正则互相
+# 漂移（旧实现只认 `[at:数字]` 小写半角，导致上述形态原样穿链发到群里）。
+#
+# 注意：`[at 123]`（无冒号）、`[at]`、`[avatar:1]` 不是标签，按普通文本处理
+# （不进入"裸标签"不变量判定范围）。
+# --------------------------------------------------------------------------- #
+_AT_TAG_HEAD_SRC = r"\[\u200b*(?i:at)[\s\u200b]*[:：]"
+_AT_TAG_PAYLOAD_SRC = r"([^\]]*)"
+
+# 载荷长度约束（r2 评审 F5）：QQ 号最长 12 位 ASCII 数字。更长的"纯数字"
+# 只可能是模型幻觉/粘贴物，渲染成 At 反而是"合法但不存在"的艾特目标。
+_AT_TAG_MAX_DIGITS: int = 12
+
+# 标签起始语法（含未闭合）：存在性判定的唯一入口，替代旧的裸 "[at:" 子串判定
+AT_TAG_HEAD_PATTERN = re.compile(_AT_TAG_HEAD_SRC)
+
+# 完整标签外壳（任意载荷）：宽松判定与非数字载荷降级用
+AT_TAG_LOOSE_PATTERN = re.compile(_AT_TAG_HEAD_SRC + _AT_TAG_PAYLOAD_SRC + r"\]")
+
+# 严格解析：载荷为 ASCII 数字或 all（大小写不敏感），容忍冒号两侧空白与零宽
+AT_TAG_PATTERN = re.compile(
+    _AT_TAG_HEAD_SRC + r"[\s\u200b]*([0-9\u200b]+|(?i:all))[\s\u200b]*\]"
+)
+
+# 扫描用（split_text_by_at_tags 内部）：完整标签优先，失败则匹配未闭合语法
+_AT_TAG_SCAN_PATTERN = re.compile(
+    _AT_TAG_HEAD_SRC + r"(?P<body>[^\]]*)\]" + r"|(?P<head>" + _AT_TAG_HEAD_SRC + r")"
+)
+
+
+def has_at_tag(text: Optional[str]) -> bool:
+    """判定文本是否含 @ 标签语法（含未闭合形态，P0-5）。
+
+    Args:
+        text: 待判定的纯文本；None/空串视为无标签。
+
+    Returns:
+        True 表示存在标签起始语法（`[at:` / `[At：` 等，闭合与否均可）。
+    """
+    if not text:
+        return False
+    return AT_TAG_HEAD_PATTERN.search(text) is not None
+
+
+def parse_at_tag_payload(raw: object) -> Tuple[str, str]:
+    """解析标签外壳内载荷的最终形态（P0-1/P0-5 唯一分类实现）。
+
+    渲染（At 组件）与降级（纯文本 `@载荷`）共用本函数，避免两套判断漂移。
+
+    Args:
+        raw: 半角/全角冒号与闭合 `]` 之间的原始载荷文本（可含零宽字符）。
+
+    Returns:
+        (kind, payload)：
+        - ("at", "123") / ("at", "all")：可解析载荷（1..12 位 ASCII 数字或 all）；
+        - ("degrade", "柴郡")：不可解析的非空载荷（含全角数字、超长数字、
+          名字、占位符）；
+        - ("drop", "")：空载荷（`[at:]` / `[at: ]`）。
+        载荷内零宽字符与嵌套标签语法会被剔除，保证返回值不再含标签语法。
+    """
+    payload = (str(raw) if raw is not None else "").replace("\u200b", "").strip()
+    if AT_TAG_HEAD_PATTERN.search(payload):
+        # 载荷里嵌套了标签语法（如 "[at:[at:123]"）：剔除语法只保留正文
+        payload = (
+            AT_TAG_HEAD_PATTERN.sub("", payload).replace("\u200b", "").strip()
+        )
+    if not payload:
+        return "drop", ""
+    if payload.isascii() and payload.isdigit() and len(payload) <= _AT_TAG_MAX_DIGITS:
+        return "at", payload
+    if payload.lower() == "all":
+        return "at", "all"
+    return "degrade", payload
 
 
 def format_role_label(role: object) -> str:
@@ -169,31 +252,50 @@ def is_at_all_in_cooldown(
 def split_text_by_at_tags(
     text: Optional[str], pattern: Optional[re.Pattern] = None
 ) -> List[Tuple[str, str]]:
-    """把文本按 [at:xxx] 标签拆分为有序段（CHG-08 标签解析纯逻辑）。
+    """把文本按 [at:xxx] 标签拆分为有序段（CHG-08 + P0-1 形态容忍）。
+
+    支持的形态见 parse_at_tag_payload：大小写、冒号两侧空白/零宽、全角
+    冒号、载荷内零宽、非数字载荷降级、空载荷删除、未闭合语法删除。
 
     Args:
         text: 待解析的纯文本。
-        pattern: 可选自定义标签正则，默认使用 AT_TAG_PATTERN。
+        pattern: 可选自定义正则（须含一个载荷捕获组）；传入时按旧式
+            "整体作为 ('at', 载荷)" 拆分，不做未闭合语法处理。
 
     Returns:
         段列表，每段为 (kind, value)：
         - ('text', 普通文本片段) —— 普通片段恒为非空；
-        - ('at', 目标ID) —— 目标ID 为纯数字字符串或 'all'。
+        - ('at', 目标ID) —— ASCII 数字或 'all'，应渲染为 At 组件；
+        - ('degrade', 载荷) —— 不可解析载荷，应降级为纯文本 `@载荷`；
+        - ('drop', '') —— 空载荷，应删除标签语法；
+        - ('unclosed', 起始语法原文) —— 未闭合标签，应删除该语法片段
+          （流式 chunk 场景可选择原样保留，见 main.py keep_unclosed）。
         空文本返回空列表。
     """
-    if pattern is None:
-        pattern = AT_TAG_PATTERN
     src = text or ""
     if not src:
         return []
     segments: List[Tuple[str, str]] = []
     last_idx = 0
-    for match in pattern.finditer(src):
-        start, end = match.span()
-        if start > last_idx:
-            segments.append(("text", src[last_idx:start]))
-        segments.append(("at", match.group(1)))
-        last_idx = end
+    if pattern is not None:
+        for match in pattern.finditer(src):
+            start, end = match.span()
+            if start > last_idx:
+                segments.append(("text", src[last_idx:start]))
+            segments.append(("at", match.group(1)))
+            last_idx = end
+    else:
+        for match in _AT_TAG_SCAN_PATTERN.finditer(src):
+            start, end = match.span()
+            if start > last_idx:
+                segments.append(("text", src[last_idx:start]))
+            body = match.group("body")
+            if body is None:
+                # 起始语法命中但无闭合 "]": 未闭合标签，回报语法原文
+                segments.append(("unclosed", match.group("head")))
+            else:
+                segments.append(parse_at_tag_payload(body))
+            last_idx = end
     tail = src[last_idx:]
     if tail:
         segments.append(("text", tail))

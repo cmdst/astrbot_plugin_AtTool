@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from utils import (
+    AT_TAG_HEAD_PATTERN,
+    AT_TAG_LOOSE_PATTERN,
     AT_TAG_PATTERN,
     audit_log_path,
     build_audit_record,
@@ -28,8 +30,10 @@ from utils import (
     format_member_choice_list,
     format_role_label,
     format_single_member_result,
+    has_at_tag,
     is_at_all_in_cooldown,
     match_session_entry,
+    parse_at_tag_payload,
     split_text_by_at_tags,
 )
 
@@ -209,14 +213,99 @@ class TestSplitTextByAtTags:
         assert split_text_by_at_tags("") == []
         assert split_text_by_at_tags(None) == []
 
-    def test_invalid_tag_treated_as_text(self):
-        # 非法标签（非数字/非 all）不被识别，整段作为普通文本
-        assert split_text_by_at_tags("[at:abc]") == [("text", "[at:abc]")]
+    def test_non_numeric_payload_returns_degrade_segment(self):
+        # 非数字载荷（模型照抄占位符 / 直接写名字）：不再原样穿链，
+        # 降级为可读纯文本（P0-1 冻结语义）
+        assert split_text_by_at_tags("[at:abc]") == [("degrade", "abc")]
 
     def test_pattern_consistent_with_module_constant(self):
         # 模块正则与 main.py 约定一致
         assert AT_TAG_PATTERN.search("[at:all]")[1] == "all"
         assert AT_TAG_PATTERN.search("[at:0000]") is not None
+
+
+# --------------------------------------------------------------------------- #
+# P0-1 / P0-5 标签形态契约（大小写 / 空白 / 全角 / 非数字载荷 / ASCII 数字约束）
+# --------------------------------------------------------------------------- #
+class TestAtTagPatternContract:
+    """标签语法单一事实来源（utils）的形态契约，对应 spec §7.2 形态清单。"""
+
+    def test_form_matrix_renders_or_degrades(self):
+        """形态矩阵：可解析 → ('at', 载荷)；不可解析 → ('degrade', 载荷)；
+        空载荷 → ('drop', '')；未闭合 → ('unclosed', 起始语法原文)。"""
+        cases = [
+            ("[at:123]", [("at", "123")]),
+            ("[At:123]", [("at", "123")]),
+            ("[AT:123]", [("at", "123")]),
+            ("[aT:123]", [("at", "123")]),
+            ("[at: 123]", [("at", "123")]),
+            ("[at：123]", [("at", "123")]),
+            ("[at : 123]", [("at", "123")]),
+            ("[at\u200b:123]", [("at", "123")]),
+            ("[at:12\u200b3]", [("at", "123")]),
+            ("[at:all]", [("at", "all")]),
+            ("[At:All]", [("at", "all")]),
+            ("[AT：ALL]", [("at", "all")]),
+            ("[at:柴郡]", [("degrade", "柴郡")]),
+            ("[At: 张三]", [("degrade", "张三")]),
+            ("[at:ID]", [("degrade", "ID")]),
+            ("[at:１２３]", [("degrade", "１２３")]),
+            ("[at:]", [("drop", "")]),
+            ("[at: ]", [("drop", "")]),
+            ("[at: 123", [("unclosed", "[at:"), ("text", " 123")]),
+            ("[At：123", [("unclosed", "[At："), ("text", "123")]),
+        ]
+        for text, expected in cases:
+            assert split_text_by_at_tags(text) == expected, text
+
+    def test_form_matrix_embedded_in_text(self):
+        """同一段文本内多个标签/降级/正文按原序拆分。"""
+        assert split_text_by_at_tags("A[At:11\u200b1] 和 [at:22\u200b2]B") == [
+            ("text", "A"),
+            ("at", "111"),
+            ("text", " 和 "),
+            ("at", "222"),
+            ("text", "B"),
+        ]
+        assert split_text_by_at_tags("看[at:柴郡]和[at:123]") == [
+            ("text", "看"),
+            ("degrade", "柴郡"),
+            ("text", "和"),
+            ("at", "123"),
+        ]
+
+    def test_plain_forms_are_not_tags(self):
+        """无冒号/非 at 前缀：当作普通文本，不进入不变量判定范围。"""
+        for text in ("[at 123]", "[at]", "[avatar:1]", "[ at:123]", "正文里的 ["):
+            assert split_text_by_at_tags(text) == [("text", text)], text
+            assert not has_at_tag(text), text
+
+    def test_ascii_digits_only(self):
+        """ASCII 数字之外不得进入 At 载荷（Python \\d 匹配全角数字的陷阱）。"""
+        for text in ("[at:１２３]", "[at:²]", "[at:１２３]与[at:456]", "[at:١٢٣]"):
+            for kind, value in split_text_by_at_tags(text):
+                if kind == "at":
+                    assert value == "all" or (value.isascii() and value.isdigit())
+        assert [s for s in split_text_by_at_tags("[at:１２３]") if s[0] == "at"] == []
+
+    def test_single_source_of_truth_exports(self):
+        """导出物互相同源：判定函数覆盖完整/未闭合形态；main.py 无字面量判定。"""
+        assert AT_TAG_PATTERN.search("[At: 123]").group(1) == "123"
+        assert AT_TAG_LOOSE_PATTERN.search("[at:柴郡]").group(1) == "柴郡"
+        assert AT_TAG_HEAD_PATTERN.search("[at\u200b:123]") is not None
+        for text in ("[at:123]", "[AT：123", "[at\u200b:1]", "[At: all]"):
+            assert has_at_tag(text), text
+        assert not has_at_tag("") and not has_at_tag(None)
+        assert parse_at_tag_payload("\u200b123\u200b") == ("at", "123")
+        assert parse_at_tag_payload(" ALL ") == ("at", "all")
+        assert parse_at_tag_payload("１２３") == ("degrade", "１２３")
+        assert parse_at_tag_payload("   ") == ("drop", "")
+        # P0-5 验收点：源码中 "[at:" 字面量判定出现次数为 0
+        src = (Path(__file__).resolve().parents[1] / "main.py").read_text(
+            encoding="utf-8"
+        )
+        assert '"[at:" in' not in src
+        assert '"[at:" not in' not in src
 
 
 # --------------------------------------------------------------------------- #
