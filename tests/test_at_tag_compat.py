@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -705,6 +706,168 @@ class TestDirectQqGroupMembership:
             "工具确认路径不受名单校验影响；非本群的直连号仍降级"
         )
         assert f"@{self.LIVE_BOGUS}" in "".join(_plain_texts(chain))
+
+
+class TestSelfTargetAndNicknameDegrade:
+    """T20：艾特"当前说话人"的窄例外 + 降级文案用昵称 + 提示词补强。
+
+    线上实测（22:20，群 1035699087）：用户说「emmmm，你这家伙」，模型没调工具
+    就直接写 `[at:2060958352]`（从宿主可见历史里学到的发送者号码），可信来源
+    约束把它降级成了裸文本 `@2060958352` —— 约束按设计生效，但把说话人显示成
+    一串号码，体验很差。本轮：自己艾特自己走真 @；降级文案优先用昵称/群名片。
+    """
+
+    SELF_QQ = "2060958352"  # 线上实测：当前说话人自己的号码
+    OTHER_MEMBER = "3882563785"  # 另一个群成员（非发送者）
+
+    @staticmethod
+    def _audit_records(audit_dir):
+        path = audit_file(audit_dir, datetime.now().strftime("%Y%m%d"))
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    async def test_self_sender_id_renders_true_at_with_audit(self, tmp_path):
+        """① 模型写 `[at:<sender_id>]`（无工具、消息里也没给号）→ 真 At + 审计。
+
+        T26/F2' 起窄例外要求"群聊 + 名单可用 + 发送者确在名单内"，因此这里按真机
+        情形给出成员名单（说话人当然是本群成员）；名单不可用/发送者不在名单的
+        降级由 `TestDirectIdMembershipBoundaries`/interplay 的 F2' 用例覆盖。
+        """
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1035699087",
+            sender_id=self.SELF_QQ,
+            chain=[
+                Plain(
+                    f"呜哇！[at:{self.SELF_QQ}] 你、你这家伙又想搞什么恶作剧啦！"
+                )
+            ],
+        )
+        ev.message_str = "emmmm，你这家伙"  # 消息里没有任何 5..12 位数字
+        ev.bot.member_list = [
+            {"user_id": self.SELF_QQ, "nickname": "陨落星辰", "card": "柴郡"}
+        ]
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert _ats(chain) == [self.SELF_QQ], "艾特当前说话人必须走真 @"
+        assert_n1(chain)
+        records = self._audit_records(tmp_path)
+        assert any(
+            r["op_type"] == "at_member" and r["target_id"] == self.SELF_QQ
+            for r in records
+        ), f"真实艾特必须写审计，实测 {records}"
+
+    async def test_other_unconfirmed_id_still_degrades(self, tmp_path):
+        """② 他人未确认 ID 仍降级（不得因新增窄例外而放宽）。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1035699087",
+            sender_id=self.SELF_QQ,
+            chain=[Plain(f"好的 [at:{self.OTHER_MEMBER}]")],
+        )
+        ev.message_str = "emmmm，你这家伙"
+        await plugin.process_at_tags(ev)
+
+        assert not any(isinstance(c, At) for c in ev.get_result().chain), (
+            "非发送者且未过工具确认的 ID 必须继续降级"
+        )
+
+    async def test_downgrade_uses_nickname_from_member_list(self, tmp_path):
+        """③ 降级文案优先用群名片/昵称（不露裸号码）。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1035699087",
+            sender_id=self.SELF_QQ,
+            chain=[Plain(f"好的 [at:{self.OTHER_MEMBER}]")],
+        )
+        ev.message_str = "emmmm，你这家伙"
+        ev.bot.member_list = [
+            {
+                "user_id": self.OTHER_MEMBER,
+                "nickname": "陨落星辰",
+                "card": "柴郡",
+                "role": "member",
+            }
+        ]
+        await plugin.process_at_tags(ev)
+
+        joined = "".join(_plain_texts(ev.get_result().chain))
+        assert "@柴郡" in joined, f"群名片优先，实测 {joined!r}"
+        assert f"@{self.OTHER_MEMBER}" not in joined, "不得再露裸号码"
+
+        # 只有昵称（无群名片）时用昵称
+        plugin2 = make_plugin(audit_dir=tmp_path)
+        ev2 = FakeEvent(
+            group_id="1035699087",
+            sender_id=self.SELF_QQ,
+            chain=[Plain(f"好的 [at:{self.OTHER_MEMBER}]")],
+        )
+        ev2.message_str = "emmmm，你这家伙"
+        ev2.bot.member_list = [
+            {"user_id": self.OTHER_MEMBER, "nickname": "陨落星辰", "card": ""}
+        ]
+        await plugin2.process_at_tags(ev2)
+        assert "@陨落星辰" in "".join(_plain_texts(ev2.get_result().chain))
+
+    async def test_downgrade_keeps_raw_number_when_list_unavailable(
+        self, monkeypatch, tmp_path
+    ):
+        """④ 名单不可用（拉取为空/失败）时维持 `@数字`，且保留聚合 warning。"""
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning", lambda *a, **k: warnings.append(a)
+        )
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id="1035699087",
+            sender_id=self.SELF_QQ,
+            chain=[Plain(f"好的 [at:{self.OTHER_MEMBER}]")],
+        )
+        ev.message_str = "emmmm，你这家伙"
+        ev.bot.member_list = []
+        await plugin.process_at_tags(ev)
+
+        joined = "".join(_plain_texts(ev.get_result().chain))
+        assert f"@{self.OTHER_MEMBER}" in joined, "解析不出昵称时维持 @数字"
+        assert any("未经工具确认" in str(w) for w in warnings), warnings
+
+    async def test_dynamic_instructions_require_tool_for_self(self, tmp_path):
+        """⑤ 代码侧动态指令明确：连当前说话人也必须先调用工具。"""
+        plugin = make_plugin(audit_dir=tmp_path)
+        instructions = plugin._build_dynamic_instructions()
+        assert "当前正在和你说话的人" in instructions
+        assert "search_and_mention" in instructions
+
+        # 工具可达时（走正常注入分支）该规则必须落到 system_prompt
+        ev = FakeEvent(group_id="1035699087", sender_id=self.SELF_QQ)
+        req = ti.make_request()  # 含 search_and_mention 的工具集
+        await plugin.inject_at_instruction(ev, req)
+        assert "当前正在和你说话的人" in req.system_prompt
+
+    async def test_self_id_in_private_chat_still_degrades(self, tmp_path):
+        """⑥ 边界：私聊无「本群」概念、At 段不可解析（平台会 1200 拒收整条），
+
+        因此窄例外仅在群聊生效；私聊里 `[at:<sender>]` 仍按未知来源降级。
+        """
+        plugin = make_plugin(audit_dir=tmp_path)
+        ev = FakeEvent(
+            group_id=None,
+            sender_id=self.SELF_QQ,
+            umo="aiocqhttp:FriendMessage:10001",
+            chain=[Plain(f"好的 [at:{self.SELF_QQ}]")],
+        )
+        ev.message_str = "emmmm，你这家伙"
+        await plugin.process_at_tags(ev)
+
+        chain = ev.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "私聊不启用该窄例外"
+        assert f"@{self.SELF_QQ}" in "".join(_plain_texts(chain))
 
 
 class TestStreamingFormRows:

@@ -474,6 +474,15 @@ class LLMAtToolPlugin(Star):
             "若 `select_member_by_index` 返回错误（序号无效或记录已过期约120秒），"
             "请重新调用 `search_and_mention` 搜索后再请用户选择。"
         )
+        # T20：连"当前说话人"也必须走工具（线上 22:20 实测：模型跳过工具直接写
+        # [at:<发送者 QQ>]，降级后把说话人显示成一串裸号码）
+        parts.append(
+            "### 艾特当前说话人也必须先调用工具\n"
+            "除「QQ号处理」小节允许的情形（用户在本条消息里直接给出了他要你艾特的"
+            " QQ 号、且该能力已开启）外，即使你要艾特当前正在和你说话的人（也就是"
+            "这条消息的发送者），也必须先调用 search_and_mention 搜索取得他的 ID，"
+            "再使用 [at:ID] 标签；不要直接写出你从历史消息或上下文里看到的号码。"
+        )
         return "\n\n".join(parts)
 
     @filter.on_llm_request()
@@ -912,17 +921,39 @@ class LLMAtToolPlugin(Star):
             for in_comp in incoming or []:
                 if isinstance(in_comp, Plain):
                     direct_ids |= set(USER_QQ_PATTERN.findall(in_comp.text))
+        group_id = event.get_group_id() or ""
+        sender_id = str(event.get_sender_id() or "")
+        # T20：链里只要有成员标签，降级时就需要昵称/群名片，因此与 T24 的直连号
+        # 过滤共用同一次成员名单拉取（_get_group_members_cached 有 180s 缓存，
+        # 工具路径通常已预热；无标签且无直连号时保持 0 次调用）。
+        need_members = bool(direct_ids) or any(
+            isinstance(comp, Plain) and has_at_tag(comp.text) for comp in chain
+        )
+        raw_members = (
+            await self._get_group_members_cached(event, group_id)
+            if need_members and group_id
+            else None
+        )
+        member_ids: set = set()
+        member_names: dict[str, str] = {}
+        for member in raw_members or []:
+            uid = str(member.get("user_id", ""))
+            if not uid:
+                continue
+            member_ids.add(uid)
+            # 群名片优先，其次昵称（T20 降级文案用）。T26/F1'：名字本身若命中
+            # 标签起始语法（成员把群名片设成 `[at:<QQ>]` 等），降级文案会把标签
+            # 原文带进群（非末段经 splitter 的 context.send_message 直发，不经本
+            # 插件二次渲染）⇒ 丢弃该名字、回退为号码。复用 has_at_tag 以覆盖
+            # 大小写/空白/全角/零宽变体，不另写正则。
+            name = str(member.get("card") or member.get("nickname") or "").strip()
+            if name and not has_at_tag(name):
+                member_names[uid] = name
         if direct_ids:
             # T16：直连号必须过本群成员名单。平台（NapCat/OneBot）对无法解析的
             # QQ 会以 retcode=1200 "Get Uid Error" 拒绝**整条消息**（线上实测
             # 22:02 respond.stage:322，正文全丢），因此只有名单内的号码才可信；
             # 不在名单内的号码不进 trusted_ids ⇒ 走既有 degrade（@数字 + 聚合告警）。
-            group_id = event.get_group_id() or ""
-            raw_members = (
-                await self._get_group_members_cached(event, group_id)
-                if group_id
-                else None
-            )
             if raw_members is None:
                 # T24/F1'（fail-closed）：名单不可用（非群聊/拉取失败/平台返回为空）
                 # 时**不得**放行直连号——否则非法 At 会被平台以 retcode=1200
@@ -935,10 +966,16 @@ class LLMAtToolPlugin(Star):
                     "拉不到名单，请检查适配器 get_group_member_list 权限/大群截断。"
                 )
             else:
-                member_ids = {
-                    str(m.get("user_id", "")) for m in raw_members if m
-                }
                 trusted_ids |= direct_ids & member_ids
+        if sender_id and group_id and sender_id in member_ids:
+            # T20 窄例外（T26/F2' 收紧）：模型想艾特"当前正在跟它说话的人"是常见
+            # 合法意图，而该 ID 由事件本身提供（event.get_sender_id()），不依赖
+            # 模型自述、无法被伪造，因此即使未经工具确认也允许渲染真 At。
+            # 但**必须同时满足**：群聊 + 名单可用 + 发送者确实在名单内 —— 原注释
+            # "该 ID 必然是本群成员"是错的前提：名单可能拉取失败/为空/被截断，
+            # 或发言后立刻退群导致平台解析不了该 At（同样会以 1200 拒收整条消息，
+            # 见 T24/T26 实测）。名单不可用时沿用 T24 的 fail-closed 降级。
+            trusted_ids.add(sender_id)
         # 未经工具确认 / 未出现在用户消息里 / 不是本群成员的 ID（聚合告警用）
         untrusted_ids: list[str] = []
 
@@ -966,7 +1003,7 @@ class LLMAtToolPlugin(Star):
         #     第 13 行）。拼出的成员 ID 必须过同一份 trusted_ids：不可信时
         #     按 degrade 语义降级为 @载荷（不渲染、也不静默删除）
         reassembled = self._merge_split_at_tags(
-            merged_input, umo, trusted_ids, untrusted_ids
+            merged_input, umo, trusted_ids, untrusted_ids, member_names
         )
         if reassembled is not None:
             merged_input = reassembled
@@ -1081,8 +1118,9 @@ class LLMAtToolPlugin(Star):
                         new_chain.append(Plain("@全体成员"))
                 elif value not in trusted_ids:
                     # T10：编造/上游残留的 ID 不得渲染成真实艾特（误伤无关成员）
+                    # T20：能从成员名单解析出群名片/昵称时不要露裸号码
                     untrusted_ids.append(value)
-                    new_chain.append(Plain("@" + value))
+                    new_chain.append(Plain("@" + (member_names.get(value) or value)))
                 else:
                     new_chain.append(At(qq=value))
                     at_member_targets.append(value)
@@ -1156,6 +1194,7 @@ class LLMAtToolPlugin(Star):
         umo: str,
         trusted_ids: set,
         untrusted_ids: list,
+        member_names: dict,
     ) -> list[BaseMessageComponent] | None:
         """P0-1 跨组件拼合：把被非 Plain 组件切碎的标签拼回并渲染为 At。
 
@@ -1173,6 +1212,7 @@ class LLMAtToolPlugin(Star):
             umo: 当前会话标识（仅用于告警日志）。
             trusted_ids: 与逐组件路径共用的同一份可信 ID 集合（T14-B2）。
             untrusted_ids: 本轮渲染中不可信 ID 的聚合列表（调用方负责告警）。
+            member_names: user_id → 群名片/昵称（T20 降级文案用；可为空）。
 
         Returns:
             重建后的链；无需拼合时返回 None（调用方保持原链不变）。
@@ -1187,7 +1227,7 @@ class LLMAtToolPlugin(Star):
                 if not isinstance(comp, Plain) or not has_at_tag(comp.text):
                     continue
                 hit = self._try_merge_split_at_tag(
-                    working, idx, umo, trusted_ids, untrusted_ids
+                    working, idx, umo, trusted_ids, untrusted_ids, member_names
                 )
                 if hit is not None:
                     break
@@ -1204,6 +1244,7 @@ class LLMAtToolPlugin(Star):
         umo: str,
         trusted_ids: set,
         untrusted_ids: list,
+        member_names: dict,
     ) -> list[BaseMessageComponent] | None:
         """尝试用 chain[idx] 起的跨组件文本拼出一个完整成员标签（P0-1）。
 
@@ -1217,6 +1258,7 @@ class LLMAtToolPlugin(Star):
             umo: 当前会话标识（仅用于告警日志）。
             trusted_ids: 与逐组件路径共用的同一份可信 ID 集合（T14-B2）。
             untrusted_ids: 不可信 ID 聚合列表（本函数只追加，调用方统一告警）。
+            member_names: user_id → 群名片/昵称（T20 降级文案用；可为空）。
 
         Returns:
             重建后的链；无法拼合时返回 None。
@@ -1267,7 +1309,11 @@ class LLMAtToolPlugin(Star):
             head_text = text[: head.start()]
             if head_text:
                 rebuilt.append(Plain(head_text))
-            rebuilt.append(At(qq=target_id) if trusted else Plain("@" + target_id))
+            rebuilt.append(
+                At(qq=target_id)
+                if trusted
+                else Plain("@" + (member_names.get(target_id) or target_id))
+            )
             consumed_map = dict(consumption)
             for j in range(idx + 1, len(chain)):
                 if j in consumed_map:

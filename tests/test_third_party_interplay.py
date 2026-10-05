@@ -357,8 +357,13 @@ class FakeContext:
 # --------------------------------------------------------------------------- #
 # 3. 驱动辅助：真实插件的公开入口（on_llm_request → on_decorating_result）
 # --------------------------------------------------------------------------- #
-def make_plugin(recorder=None):
+def make_plugin(recorder=None, config=None):
     """构造真实插件实例；用 FakeContext 录制 splitter 直发路径。
+
+    Args:
+        recorder: 交付录制器（与事件共享）。
+        config: 覆盖默认配置项（T21 用于验证用户已保存的 llm_prompt 不被改写）。
+    
 
     返回的 plugin.context.delivery 与该 recorder 是同一对象，测试用
     ``new_plugin_and_event()`` 可让事件路径与 context 直发路径共用一个
@@ -376,6 +381,8 @@ def make_plugin(recorder=None):
         "enable_audit_log": True,
         "member_list_cache_ttl": 180,
     }
+    if config:
+        cfg.update(config)
     plugin = main_mod.LLMAtToolPlugin(context=context, config=cfg)
     plugin._audit_dir = Path("/tmp/attool-verifier-audit")
     return plugin
@@ -2301,3 +2308,534 @@ class TestDirectIdMembershipSideEffects:
         await event.send_streaming(gen(), False)
         assert event.delivery.at_targets() == [MEMBER_QQ]
         assert event.delivery.naked_tags() == []
+
+
+# =========================================================================== #
+# T21 追加：自目标窄例外的绕过面 + 降级文案 + 动态提示词（我自建断言）
+# =========================================================================== #
+
+# 线上 22:20（群 1035699087）实测的发送者本人 QQ 与模型编造的他人号
+SELF_QQ = "2060958352"
+OTHER_UNCONFIRMED_QQ = "3882563785"
+
+
+def _plain_text(chain) -> str:
+    return "".join(
+        c.text for c in chain if isinstance(c, Plain)
+    ).replace("\u200b", "")
+
+
+class TestSelfTargetNarrowException:
+    """自目标窄例外（T20）：sender_id 可信，但不许放宽到任何其它 ID。"""
+
+    async def test_live_22_20_scenario_renders_true_at_with_audit(self, tmp_path):
+        """复刻线上 22:20：模型未调工具直接写 [at:<发送者本人>] → 真 At + 审计。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"好的 [at:{SELF_QQ}] 收到")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你有什么想说的",     # 消息里没有号码，工具也没被调用
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = [
+            {"user_id": SELF_QQ, "nickname": "陨落星辰", "card": "柴郡"}
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        targets = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert targets == [SELF_QQ], f"自目标应渲染真 At，实测 {targets}"
+        files = _audit_files(tmp_path)
+        assert files, "自目标放行必须写 at_member 审计"
+        body = files[0].read_text(encoding="utf-8")
+        assert '"at_member"' in body and SELF_QQ in body, body[:200]
+
+    async def test_other_unconfirmed_id_still_degrades(self):
+        """同一链里他人的未确认 ID 仍降级（窄例外不得放宽）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{SELF_QQ}] 和 [at:{OTHER_UNCONFIRMED_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        chain = event.get_result().chain
+        assert [str(c.qq) for c in chain if isinstance(c, At)] == [SELF_QQ]
+        assert f"@{OTHER_UNCONFIRMED_QQ}" in _plain_text(chain), "他人号应降级"
+
+    async def test_self_exception_disabled_in_private_chat(self):
+        """私聊：无 group_id ⇒ 窄例外不启用，自目标也降级（At 段不可解析）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{SELF_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+            group_id=None,
+            umo="aiocqhttp:FriendMessage:10001",
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        chain = event.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "私聊不得渲染 At"
+        assert f"@{SELF_QQ}" in _plain_text(chain)
+
+    async def test_self_id_via_cross_component_merge(self):
+        """跨组件拼合出来的正是发送者 ID → 同样命中窄例外。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:20609"), At(qq="999"), Plain("58352]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        targets = [str(c.qq) for c in event.get_result().chain if isinstance(c, At)]
+        assert targets == [SELF_QQ, "999"], f"实测 {targets}"
+
+    async def test_self_id_in_streaming_path(self):
+        plugin, event = new_plugin_and_event(
+            chain=[], trusted_ids=set(), sender_id=SELF_QQ, user_message="你好"
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
+
+        async def gen():
+            yield mc_cls(chain=[Plain(f"[at:{SELF_QQ}]")])
+
+        await event.send_streaming(gen(), False)
+        assert event.delivery.at_targets() == [SELF_QQ]
+
+    async def test_at_all_unaffected_by_self_exception(self):
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:all]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": SELF_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        assert [str(c.qq) for c in event.get_result().chain if isinstance(c, At)] == ["all"]
+
+    async def test_bot_own_id_as_sender_is_benign(self):
+        """发送者是名单内成员（含 bot 自身/主动触发的场景）：例外只覆盖他一个。
+
+        T26/F2' 起例外需与名单求交，因此这里把发送者放进名单；同链里另一个
+        未确认 ID 仍必须降级。
+        """
+        plugin, event = new_plugin_and_event(
+            chain=[
+                Plain(f"[at:{OTHER_UNCONFIRMED_QQ}] 和 [at:{SELF_QQ}]")
+            ],
+            trusted_ids=set(),
+            sender_id=OTHER_UNCONFIRMED_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": OTHER_UNCONFIRMED_QQ, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        chain = event.get_result().chain
+        assert [str(c.qq) for c in chain if isinstance(c, At)] == [
+            OTHER_UNCONFIRMED_QQ
+        ], "例外只覆盖'当前发送者'自身，不会扩大到其它 ID"
+        assert f"@{SELF_QQ}" in _plain_text(chain), "他人未确认 ID（这里 2060958352）仍降级"
+
+
+class TestMemberCardTagSyntaxSanitized:
+    """T26/F1'：成员群名片/昵称里含标签语法时，降级文案必须先净化再注入。
+
+    成员可以把群名片设成 `[at:<QQ>]`；降级文案若原样带上它，标签就会经
+    splitter 非末段的 `context.send_message`（不经 AtSend 包装器）直接进群，
+    违反不变量 N1。本组用例覆盖名片形态 × 四条交付路径。
+    """
+
+    # 名片形态：半角/大写/全角冒号/冒号后空格/冒号后零宽（均命中 has_at_tag）
+    CARD_FORMS = [
+        "[at:1645896432]",
+        "[At:1645896432]",
+        "[at：1645896432]",
+        "[at: 1645896432]",
+        "[at:\u200b1645896432]",
+    ]
+
+    @staticmethod
+    def _bot_with_card(card: str) -> FakeBot:
+        return FakeBot(
+            members=[
+                {
+                    "user_id": OTHER_UNCONFIRMED_QQ,
+                    "nickname": card,
+                    "card": card,
+                }
+            ]
+        )
+
+    @pytest.mark.parametrize("card", CARD_FORMS)
+    async def test_splitter_and_main_hook_paths_never_leak(self, card):
+        """主钩子 + splitter 真实路径（非末段 context.send_message）都不穿链。"""
+        plugin, event = new_plugin_and_event(
+            chain=[
+                Plain(f"第一段 [at:{OTHER_UNCONFIRMED_QQ}] 尾巴\n\n第二段正文")
+            ],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+            bot=self._bot_with_card(card),
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await splitter_real_path(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.naked_tags() == [], (
+            f"名片 {card!r} 经 splitter 路径穿链：{event.delivery.naked_tags()}"
+        )
+        assert event.delivery.at_targets() == [], "降级文本不得升级成真 At"
+        joined = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        assert f"@{OTHER_UNCONFIRMED_QQ}" in joined, f"应回退为 @号码，实测 {joined!r}"
+
+    @pytest.mark.parametrize("card", CARD_FORMS)
+    async def test_send_wrapper_path_never_leaks(self, card):
+        """清链逐段 send（send 包装器路径）同样不穿链。"""
+        plugin, event = new_plugin_and_event(
+            chain=[
+                Plain(f"前段 [at:{OTHER_UNCONFIRMED_QQ}] 尾巴\n\n后段正文")
+            ],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+            bot=self._bot_with_card(card),
+        )
+        await run_llm_request(plugin, event)
+        await third_party_clear_and_send_each(plugin, event)
+        await run_main_hook(plugin, event)
+
+        assert event.delivery.naked_tags() == [], (
+            f"名片 {card!r} 经 send 路径穿链：{event.delivery.naked_tags()}"
+        )
+        assert event.delivery.at_targets() == []
+        joined = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        assert f"@{OTHER_UNCONFIRMED_QQ}" in joined, f"应回退为 @号码，实测 {joined!r}"
+
+    @pytest.mark.parametrize("card", CARD_FORMS)
+    async def test_streaming_path_never_leaks(self, card):
+        """流式路径同样不穿链（单 chunk 内含该标签）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+            bot=self._bot_with_card(card),
+        )
+        await run_llm_request(plugin, event)
+        mc_cls = sys.modules["astrbot.core.message.message_event_result"].MessageChain
+
+        async def gen():
+            yield mc_cls(chain=[Plain(f"回复 [at:{OTHER_UNCONFIRMED_QQ}]")])
+
+        await event.send_streaming(gen(), False)
+
+        assert event.delivery.naked_tags() == [], (
+            f"名片 {card!r} 经流式路径穿链：{event.delivery.naked_tags()}"
+        )
+        joined = "".join(
+            event.delivery.text_of(i) for i in range(len(event.delivery.chains()))
+        )
+        assert f"@{OTHER_UNCONFIRMED_QQ}" in joined, f"应回退为 @号码，实测 {joined!r}"
+
+    async def test_clean_card_still_shown_as_nickname(self):
+        """回归护栏：不含标签语法的名片仍按 T20 的语义展示为 @昵称。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"好的 [at:{OTHER_UNCONFIRMED_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+            bot=FakeBot(
+                members=[
+                    {
+                        "user_id": OTHER_UNCONFIRMED_QQ,
+                        "nickname": "陨落星辰",
+                        "card": "柴郡",
+                    }
+                ]
+            ),
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        text = _plain_text(event.get_result().chain)
+        assert "@柴郡" in text and f"@{OTHER_UNCONFIRMED_QQ}" not in text, text
+
+
+class TestSelfTargetBypassAttacks:
+    """对窄例外的对抗：能否借此把任意 ID 渲染/交付出去。"""
+
+    async def test_member_card_with_tag_syntax_leaks_naked_tag_via_splitter(self):
+        """【finding F1'】成员群名片里带 `[at:QQ]` → 降级文案把标签语法带进交付。
+
+        splitter 的非末段走 `context.send_message`（不经 AtTool 的 send 包装器
+        二次渲染），因此裸标签会**直接进群**——违反不变量 N1。
+        """
+        victim = "1645896432"
+        bot = FakeBot(
+            members=[{"user_id": OTHER_UNCONFIRMED_QQ,
+                      "nickname": f"[at:{victim}]", "card": f"[at:{victim}]"}]
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"第一段 [at:{OTHER_UNCONFIRMED_QQ}] 尾巴\n\n第二段正文")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+            bot=bot,
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await splitter_real_path(plugin, event)
+        await framework_deliver_final(event)
+
+        leaked = event.delivery.naked_tags()
+        assert leaked == [], (
+            f"T26/F1' 起名字先净化 ⇒ 不得再有裸标签进群，实测 {leaked}"
+        )
+        assert event.delivery.at_targets() == [], "未升级成真 At"
+        joined = "".join(event.delivery.text_of(i) for i in range(len(event.delivery.chains())))
+        assert f"@{OTHER_UNCONFIRMED_QQ}" in joined, (
+            f"应回退为 @号码，实测 {joined!r}"
+        )
+
+    async def test_card_tag_syntax_reaches_final_segment_sanitized(self):
+        """对照：同一注入若落在末段，会被 send 包装器二次渲染并降级（不穿链）。"""
+        victim = "1645896432"
+        bot = FakeBot(
+            members=[{"user_id": OTHER_UNCONFIRMED_QQ,
+                      "nickname": f"[at:{victim}]", "card": f"[at:{victim}]"}]
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{OTHER_UNCONFIRMED_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="帮忙",
+            bot=bot,
+        )
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        await framework_deliver_final(event)
+
+        assert event.delivery.naked_tags() == [], "末段经 send 包装应已净化"
+        # T26/F1'：名字在注入前就被净化 ⇒ 降级文案里不再出现标签语法，
+        # 因此 send 包装器的二次渲染无事可做，文案就是 @号码。
+        assert event.delivery.text_of(-1) == f"@{OTHER_UNCONFIRMED_QQ}", (
+            f"实测 {event.delivery.text_of(-1)!r}"
+        )
+
+    async def test_self_exception_ignores_membership_when_sender_not_in_list(
+        self, tmp_path, monkeypatch
+    ):
+        """【T26/F2' 修复后】名单可用但发送者不在其中（退群竞态）→ 不加例外、降级。
+
+        原用例记录 T20 的缺陷（无条件放行发送者 ID）；T26 把例外收紧为“群聊 +
+        名单可用 + 发送者确在名单内”，故这里翻转断言：无 At、@号码保留、正文可
+        交付、不写 at_member 审计、有聚合 warning。
+        """
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{SELF_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = [{"user_id": OTHER_UNCONFIRMED_QQ, "nickname": "路人", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        chain = event.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), (
+            "发送者不在名单内时不得放行（否则平台解析不了该 At 会拒收整条消息）"
+        )
+        assert f"@{SELF_QQ}" in _plain_text(chain), "应降级为 @号码 保留可见性"
+        assert chain, "降级后仍必须是可交付的一条消息"
+        assert _audit_files(tmp_path) == [], "被拒绝的 ID 不得写 at_member 审计"
+        assert any("未经工具确认" in w for w in warnings), warnings
+
+    async def test_self_exception_disabled_when_member_list_unavailable(self):
+        """名单不可用（拉取为空/失败）⇒ 窄例外同样不启用（沿用 T24 fail-closed）。"""
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{SELF_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = []
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        chain = event.get_result().chain
+        assert not any(isinstance(c, At) for c in chain), "名单不可用时不得启用窄例外"
+        assert f"@{SELF_QQ}" in _plain_text(chain)
+
+    async def test_unresolvable_self_at_kills_whole_message(self):
+        """【平台语义对照】一个"已确认可信但平台解析不了"的 At → 1200 整条丢失。
+
+        T26/F2' 起，未经名单求交的发送者 ID 不会再被放行（见上一条用例），因此
+        这里显式把该 ID 标为已确认（等价于工具确认路径 / O1 的退群竞态），用来
+        演示平台的 1200 后果本身仍然成立。
+        """
+        plugin, event = new_platform_event(
+            chain=[Plain(f"回复正文 [at:{SELF_QQ}]")],
+            platform_valid_qqs={OTHER_UNCONFIRMED_QQ},   # 平台解析不了该发送者
+            trusted_ids={SELF_QQ},
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [{"user_id": OTHER_UNCONFIRMED_QQ, "nickname": "路人", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        outcome = await platform_deliver_or_reject(event)
+        assert outcome == "rejected", (
+            "窄例外放行的 At 一旦平台解析不了，整条消息仍会被拒（T16/T24 症状）"
+        )
+        assert event.delivery.chains() == [], "正文一并丢失"
+
+
+class TestNicknameDegrade:
+    """降级文案：昵称优先、不得露裸号码；解析不到才回退 @数字。"""
+
+    async def test_downgrade_uses_card_then_nickname(self, tmp_path, monkeypatch):
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        victim = "1645896432"
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{victim}] 和 [at:{OTHER_UNCONFIRMED_QQ}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = [
+            {"user_id": victim, "nickname": "陨落星辰", "card": "柴郡"},
+            {"user_id": OTHER_UNCONFIRMED_QQ, "nickname": "路人甲", "card": ""},
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert "@柴郡" in text, f"群名片优先，实测 {text!r}"
+        assert "@路人甲" in text, f"无名片用昵称，实测 {text!r}"
+        assert victim not in text and OTHER_UNCONFIRMED_QQ not in text, (
+            f"不得出现裸号码，实测 {text!r}"
+        )
+        assert _audit_files(tmp_path) == [], "降级不写 at_member 审计"
+        assert any("未经工具确认" in w for w in warnings)
+
+    async def test_downgrade_falls_back_to_number_when_list_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        warnings: list = []
+        monkeypatch.setattr(
+            main_mod.logger, "warning",
+            lambda *a, **k: warnings.append(a[0] if a else ""),
+        )
+        victim = "1645896432"
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{victim}]")],
+            trusted_ids=set(),
+            user_message=f"艾特 {victim}",
+        )
+        plugin._audit_dir = tmp_path
+        event.bot.member_list = []          # 名单不可用（T24 fail-closed）
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        text = _plain_text(event.get_result().chain)
+        assert f"@{victim}" in text, f"解析不到昵称时回退 @数字，实测 {text!r}"
+        assert not any(isinstance(c, At) for c in event.get_result().chain)
+        assert _audit_files(tmp_path) == []
+        assert any("未经工具确认" in w or "群成员名单" in w for w in warnings)
+
+    async def test_nickname_used_in_cross_component_merge_path(self):
+        """跨组件拼合路径的降级同样用昵称（两条路径同口径）。"""
+        from utils import parse_at_tag_payload  # noqa: F401  仅确认解析入口存在
+        victim = "1645896432"
+        plugin, event = new_plugin_and_event(
+            chain=[Plain("[at:1645896"), At(qq="999"), Plain("432]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="你好",
+        )
+        event.bot.member_list = [
+            {"user_id": victim, "nickname": "陨落星辰", "card": "柴郡"}
+        ]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+        text = _plain_text(event.get_result().chain)
+        assert "@柴郡" in text, f"拼合路径降级也应用昵称，实测 {text!r}"
+
+
+class TestDynamicInstructionSelfAt:
+    async def test_dynamic_instructions_require_tool_for_self(self):
+        plugin = make_plugin()
+        text = plugin._build_dynamic_instructions()
+        assert "当前正在和你说话的人" in text, "应说明'当前说话人'场景"
+        assert "search_and_mention" in text
+        assert "必须先调用" in text or "也必须先调用" in text
+
+    async def test_injected_prompt_contains_rule_and_keeps_user_prompt(self):
+        user_prompt = "【用户自定义】请用 ds娘 的语气说话。"
+        plugin = make_plugin(config={"llm_prompt": user_prompt})
+        assert plugin.llm_prompt_base == user_prompt
+
+        plugin2, event = new_plugin_and_event(chain=[], trusted_ids=set())
+        plugin2.llm_prompt_base = user_prompt
+        req = await run_llm_request(plugin2, event)
+        assert user_prompt in req.system_prompt, "用户已保存的 llm_prompt 必须原样保留"
+        assert "当前正在和你说话的人" in req.system_prompt, "动态段应已注入"
+
+    async def test_llm_prompt_config_not_mutated(self):
+        user_prompt = "【用户自定义】保持原样"
+        cfg = {"llm_prompt": user_prompt}
+        plugin = make_plugin(config=cfg)
+        plugin._build_dynamic_instructions()
+        assert cfg["llm_prompt"] == user_prompt, "配置对象不得被插件改写"
+        assert plugin.config["llm_prompt"] == user_prompt
+
+
+# --------------------------------------------------------------------------- #
+# 21b. 其它 ID 来源变体：引用消息 / 入站链（都走同一份成员校验）
+# --------------------------------------------------------------------------- #
+class TestMembershipSourceVariants:
+    async def test_quoted_message_id_goes_through_membership_check(self):
+        """引用消息里出现的他人 ID：同样要过本群成员名单（不因来源是"引用"而放宽）。"""
+        victim_ok = "1645896432"       # 本群成员
+        victim_bad = "3882563785"      # 非本群成员
+        plugin, event = new_plugin_and_event(
+            chain=[Plain(f"[at:{victim_ok}] 和 [at:{victim_bad}]")],
+            trusted_ids=set(),
+            sender_id=SELF_QQ,
+            user_message="",
+            incoming=[Plain(f"（引用）他说：可以艾特 {victim_ok} 或者 {victim_bad}")],
+        )
+        event.bot.member_list = [{"user_id": victim_ok, "nickname": "柴郡", "card": ""}]
+        await run_llm_request(plugin, event)
+        await run_main_hook(plugin, event)
+
+        chain = event.get_result().chain
+        targets = [str(c.qq) for c in chain if isinstance(c, At)]
+        assert targets == [victim_ok], f"引用来源也要过成员名单，实测 {targets}"
+        # 非成员号降级；它不在名单里，因此没有昵称可用 → 回退 @数字
+        assert f"@{victim_bad}" in _plain_text(chain), "非成员号应降级为 @数字"
