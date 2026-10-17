@@ -2,17 +2,21 @@
 
 作者：verifier（独立验证员）。本文件**不依赖**实现者 tests/test_integration_main.py
 的测试桩与断言，自带最小 astrbot 桩、FakeEvent/FakeContext/FakeBot 与交付录制器，
-可单文件独立运行：
+可单文件独立运行（**cwd = 本仓库根**，也就是插件目录）：
 
-    cd /root/AstrBot/data/plugins/astrbot_plugin_AtTool
-    /root/AstrBot/.venv/bin/python -m pytest tests/test_third_party_interplay.py -q   # 修复后：全绿
+    PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_third_party_interplay.py -q   # 修复后：全绿
 
-同一份用例在 HEAD(v2.5.2) 基线 worktree 上复跑即为「修复前」对照：
+别把 cwd 设成 AstrBot 的安装副本（`data/plugins/astrbot_plugin_AtTool/`）：`import astrbot`
+会在 cwd 下建嵌套 `data/`，`__pycache__` 也会落进生产树。本机系统 python3 没有 pytest 时，
+换成装了 pytest 的解释器（本机为 `/root/AstrBot/.venv/bin/python`）。
 
-    git -C /root/AstrBot/data/plugins/astrbot_plugin_AtTool worktree add /tmp/attool-baseline HEAD
+同一份用例在 `v2.5.2` 基线 worktree 上复跑即为「修复前」对照。基线要写成 **tag**，别写
+`HEAD` —— HEAD 会随版本前移，写 HEAD 得到的不是基线：
+
+    git worktree add /tmp/attool-baseline v2.5.2
     cp tests/test_third_party_interplay.py /tmp/attool-baseline/tests/
     cd /tmp/attool-baseline && ATTOOL_PLUGIN_ROOT=/tmp/attool-baseline \
-      /root/AstrBot/.venv/bin/python -m pytest tests/test_third_party_interplay.py -q
+      PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_third_party_interplay.py -q
 
 第三方分段插件的投递语义按 astrbot_plugin_splitter 真实代码建模（只读核对）：
 - main.py:504-582：非末段 `_send_proactive_segment()` 立即直发、末段回填
