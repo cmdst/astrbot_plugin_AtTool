@@ -619,7 +619,10 @@ class LLMAtToolPlugin(Star):
         - 未找到成员时如实说明，不要凭昵称猜测 ID 或伪造标签。
 
         Args:
-            name(string): 要搜索的群成员昵称或群名片，例如"张三"、"群主"、"管理员"。
+            name(string): 要搜索的群成员昵称或群名片，例如"张三"、"小李"。注意：本工具
+                只按**名字**匹配，**不认角色词**——"群主"、"管理员"这类词不是任何人的
+                昵称或群名片，传进来不会命中成员；要按角色或权限查人，请改用「群成员查询」
+                插件的工具（如 qq_group_member_summary）。
         """
         setattr(event, "_attool_tool_called", True)
         umo = event.unified_msg_origin
