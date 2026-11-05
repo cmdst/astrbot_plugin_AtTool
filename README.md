@@ -6,21 +6,48 @@ AtTool 为 AstrBot 提供 QQ 群成员搜索与艾特标签渲染。模型按昵
 
 ## 安装与开始使用
 
-在 AstrBot 插件管理中使用本仓库地址安装：
+### 先选安装来源
+
+| 安装来源 | 会得到什么 |
+| --- | --- |
+| 本仓库的默认分支 `main` | 当前版本字段为 `v2.6.5` 的主线代码，含 v2.6.x 的改动；不等于安装 GitHub 上最近一次正式 Release。 |
+| 明确选择 `v2.5.2` 标签或该 Release 的安装包 | 已确认于 2026-09-09 正式发布的历史版本，不包含 v2.6.x 的后续改动。 |
+
+**只填写仓库地址、未指定分支或标签时，不会自动固定到 v2.5.2。** 普通 `git clone` 会检出默认分支（本仓库为 `main`）；使用默认 HEAD 源码归档的安装方式同样不是按 Release 选版。AstrBot 的具体取源方式随版本和安装入口而异，仍需核对实际安装来源和选项。若要复现某个正式版本，请明确使用对应标签或 Release 安装包，不要仅凭仓库地址判断版本。
+
+本 README 描述当前主线；v2.5.2 的功能、配置及行为请对照[该版 Release](https://github.com/cmdst/astrbot_plugin_AtTool/releases/tag/v2.5.2)和[标签源码](https://github.com/cmdst/astrbot_plugin_AtTool/tree/v2.5.2)。正式发布不代表比主线更新或更安全：v2.5.2 不含后续的可信 ID 来源检查、直接号码成员校验等改动。主线自身也有本文披露的[已知限制](#已知限制与隐私)。
+
+### 从仓库安装当前主线
+
+在 AstrBot 插件管理中使用本仓库地址安装，并确认目标为默认分支 `main`：
 
 ```text
 https://github.com/cmdst/astrbot_plugin_AtTool
 ```
 
-通过插件市场安装时，请核对条目指向的仓库，避免混淆原仓库与本维护版。手动安装可在自己的 AstrBot 插件目录中执行：
+通过插件市场安装时，请核对条目指向的仓库及所提供的版本选择，避免混淆原仓库、本维护版和历史 Release。手动安装当前主线可在自己的 AstrBot 插件目录执行：
 
 ```bash
 # 请先把路径替换为自己的 AstrBot 根目录
 cd "<AstrBot 根目录>/data/plugins"
-git clone https://github.com/cmdst/astrbot_plugin_AtTool.git
+git clone --branch main --single-branch https://github.com/cmdst/astrbot_plugin_AtTool.git
 ```
 
-随后通过管理界面加载插件。已有安装应先备份代码和配置，避免覆盖本地修改。
+### 安装已确认的正式 Release
+
+若需要历史正式版本 v2.5.2，可使用[该 Release 的 ZIP 安装包](https://github.com/cmdst/astrbot_plugin_AtTool/releases/tag/v2.5.2)，按所用 AstrBot 版本支持的本地插件安装方式导入；支持手动安装时，也可按标签克隆：
+
+```bash
+# 与上面的 main 安装方式二选一，仅用于全新安装
+cd "<AstrBot 根目录>/data/plugins"
+git clone --branch v2.5.2 --single-branch https://github.com/cmdst/astrbot_plugin_AtTool.git
+```
+
+按标签克隆会处于 detached HEAD，这是固定历史代码的正常状态；不要把后续管理界面的“更新”当作保持该标签的保证。已有安装不要重复克隆或直接覆盖，尤其从 v2.6.5 改回 v2.5.2 属于降级，应先备份并核对配置与行为差异。
+
+### 加载与检查
+
+通过管理界面加载插件后，核对插件详情中的版本字段和加载结果。版本字段可区分这里的 v2.5.2 与 v2.6.5，但不能区分同一版本号下的后续提交；需要精确复现时，同时记录标签或提交号。
 
 1. 使用支持工具调用的模型，并启用插件。
 2. 如果会话或人设限制工具列表，放行 `search_and_mention` 和 `select_member_by_index`。
